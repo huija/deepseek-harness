@@ -4,6 +4,9 @@ const state = vi.hoisted(() => ({ failure: new Error('sharp native binding unava
 
 vi.mock('../src/sharp.ts', () => ({
   requireSharp: () => { throw state.failure },
+  // The Linux sharp worker has its own specs; this one pins the in-process path.
+  shouldUseSharpWorker: () => false,
+  getSharpWorker: () => { throw state.failure },
 }))
 
 import { detectImage, probeImage } from '../src/image.ts'

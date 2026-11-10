@@ -8,6 +8,7 @@ import { isDesktopUpdateChannel } from './settings-file.ts'
 import type { ProductEventMap, ProductEvent } from '@deepseek-ai/dsh-client-product-analytics/types'
 import { WINDOWS_TITLEBAR_HEIGHT } from './windows-layout.ts'
 import { access, readFile, writeFile } from 'node:fs/promises'
+import { execFile } from 'node:child_process'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import {
@@ -23,6 +24,7 @@ import {
   protocol,
   session,
   shell,
+  Notification,
   type IpcMainInvokeEvent,
   type MenuItemConstructorOptions,
 } from 'electron'
@@ -61,7 +63,7 @@ import { DesktopMandatoryUpdatePolicy, resolveDesktopPolicyConfig, type DesktopP
 import { desktopClientMetadata, desktopClientVersion } from './client-metadata.ts'
 import { DesktopMandatoryUpdateWindow } from './mandatory-update-window.ts'
 import { DesktopPolicyTestAuth } from './policy-test-auth.ts'
-import { readDesktopSettings } from './settings.ts'
+import { readDesktopSettings, writeDesktopSettings, DESKTOP_NOTIFICATION_DEFAULTS, type DesktopCloseBehavior, type DesktopNotificationCategory, type DesktopNotificationSettings } from './settings.ts'
 import { readDesktopLocaleCache, writeDesktopLocaleCache } from './locale-cache.ts'
 import { DesktopUpdateDialog, type UpdateDialogOptions } from './update-dialog.ts'
 import { readDesktopRuntime } from './runtime-tree.ts'
@@ -203,6 +205,8 @@ interface RuntimeResources {
   readonly node: string
   readonly pnpm: string
   readonly dsh: string
+  /** 独立 Node 二进制路径（仅 Linux 打包模式），用于 sharp worker 子进程 */
+  readonly standaloneNode?: string
 }
 
 function runtimeResources(): RuntimeResources {
@@ -214,7 +218,14 @@ function runtimeResources(): RuntimeResources {
       : join(process.resourcesPath, 'runtime', 'primary-runtime', 'dependencies', 'pnpm', 'bin', 'pnpm.mjs'))
   const dsh = (development ? process.env.DSH_DESKTOP_DSH_DIR : undefined)
     ?? (development ? join(app.getAppPath(), '.desktop-build', 'development', 'project') : join(app.getAppPath(), 'dsh'))
-  return { node, nodeBin, pnpm, dsh }
+  // Linux: 独立 Node 二进制路径，用于 sharp worker 子进程
+  // 独立 Node 不链接 GTK/gobject/glib，从根源消除 sharp/libvips 的符号碰撞
+  const standaloneNode = development
+    ? undefined
+    : (process.platform === 'linux'
+      ? join(process.resourcesPath, 'runtime', 'primary-runtime', 'dependencies', 'node', 'bin', 'node')
+      : undefined)
+  return { node, nodeBin, pnpm, dsh, ...(standaloneNode !== undefined ? { standaloneNode } : {}) }
 }
 
 function developmentPrimaryRuntime(): string {
@@ -274,6 +285,15 @@ function createWindow(preload: string, show = false, primary = false): BrowserWi
       titleBarOverlay: { height: WINDOWS_TITLEBAR_HEIGHT, color: chromeFallbackFill(),
         symbolColor: nativeTheme.shouldUseDarkColors ? '#f9fafb' : '#0f1115' },
     } : {}),
+    // Linux has no native overlay for a hidden caption; the renderer draws its
+    // own window controls beside the caption menus.
+    ...(process.platform === 'linux' && primary ? {
+      titleBarStyle: 'hidden' as const,
+      // Linux: set the window icon so the taskbar/dock shows the app logo
+      // instead of a generic gear. Uses the white-canvas artwork, which stays
+      // legible on dark panels, not the theme-dependent tray icon.
+      icon: nativeImage.createFromPath(join(process.resourcesPath, 'icon-tile.png')),
+    } : {}),
     // hiddenInset places traffic lights inside the sidebar; sidebar vibrancy
     // needs a transparent window background to show through the page.
     ...(process.platform === 'darwin' ? {
@@ -299,8 +319,36 @@ function createWindow(preload: string, show = false, primary = false): BrowserWi
     if (['http:', 'https:'].includes(new URL(url).protocol)) void shell.openExternal(url)
     return { action: 'deny' }
   })
-  if (process.platform === 'darwin' || process.platform === 'win32') {
-    // Fullscreen hides native window controls; overlays drop their caption clearance.
+  // Linux: Electron 44 BrowserWindow({icon}) and window.setIcon() do NOT set
+  // the _NET_WM_ICON X11 property — Deepin/GNOME docks fall back to a generic
+  // gear or a white background. We work around this by calling a small
+  // statically-linked X11 tool that sets _NET_WM_ICON directly via XChangeProperty.
+  // The window/taskbar icon is always the white-canvas artwork,
+  // independent of light/dark theme — only the tray icon follows the theme.
+  if (process.platform === 'linux' && primary) {
+    const iconTilePath = join(process.resourcesPath, 'icon-tile.png')
+    const toolPath = join(process.resourcesPath, 'set-net-wm-icon')
+    // window.setIcon() first (sets WM_HINTS on some window managers)
+    const iconImg = nativeImage.createFromPath(iconTilePath)
+    if (!iconImg.isEmpty()) window.setIcon(iconImg)
+    // Then set _NET_WM_ICON via the X11 tool for docks that require it.
+    // 256×256 gives crisp rendering on HiDPI docks (32px slot × 2x scale = 64px).
+    const sizedIcon = iconImg.isEmpty() ? iconImg : iconImg.resize({ width: 256, height: 256 })
+    const tmpIconPath = join(app.getPath('temp'), 'deepseek-harness-net-wm-icon.png')
+    if (!sizedIcon.isEmpty()) {
+      void writeFile(tmpIconPath, sizedIcon.toPNG()).then(() => {
+        const winId = `0x${window.getNativeWindowHandle().readBigUInt64LE().toString(16)}`
+        execFile(toolPath, [winId, tmpIconPath], (err) => {
+          if (err) console.warn('desktop: failed to set _NET_WM_ICON', err)
+        })
+      }).catch((error: unknown) => {
+        // An unstaged bitmap only costs the taskbar icon its _NET_WM_ICON property.
+        console.warn('desktop: failed to stage the _NET_WM_ICON bitmap', error)
+      })
+    }
+  }
+  if (process.platform === 'darwin' || process.platform === 'win32' || process.platform === 'linux') {
+    // Fullscreen hides native window controls; captions drop their clearance.
     const sendFullscreen = (): void => {
       if (!window.isDestroyed()) window.webContents.send(DESKTOP_IPC.windowFullscreen, window.isFullScreen())
     }
@@ -316,6 +364,16 @@ function createWindow(preload: string, show = false, primary = false): BrowserWi
     }
     nativeTheme.on('updated', updateBackground)
     window.once('closed', () => { nativeTheme.removeListener('updated', updateBackground) })
+  }
+  if (process.platform === 'linux') {
+    // Custom Linux caption window controls mirror the maximize state so the
+    // caption button swaps between maximize and restore glyphs.
+    const sendMaximized = (): void => {
+      if (!window.isDestroyed()) window.webContents.send(DESKTOP_IPC.windowMaximized, window.isMaximized())
+    }
+    window.on('maximize', sendMaximized)
+    window.on('unmaximize', sendMaximized)
+    window.webContents.on('did-finish-load', sendMaximized)
   }
   if (process.platform === 'darwin') {
     // Deminiaturize reattaches the NSVisualEffectView material late
@@ -379,7 +437,7 @@ function createWindow(preload: string, show = false, primary = false): BrowserWi
 }
 
 async function main(): Promise<void> {
-  const desktopSettings = await readDesktopSettings(app.getPath('userData'))
+  let desktopSettings = readDesktopSettings(app.getPath('userData'))
   void pruneCrashReports(app.getPath('logs'))
   const journalDirectory = process.env.DSH_DESKTOP_UPDATE_JOURNAL_DIR
   const updateJournal = journalDirectory === undefined ? undefined : new DesktopUpdateJournal(journalDirectory, app.getVersion())
@@ -446,6 +504,15 @@ async function main(): Promise<void> {
   let mandatoryUI: DesktopMandatoryUpdateWindow | undefined
   let policyAuth: DesktopPolicyTestAuth | undefined
   let tray: DesktopTray | undefined
+  /** Track which session is currently shown in the UI. */
+  let currentSessionId: string | undefined
+  /**
+   * The session owning the most recent unread notification, so a tray click
+   * can open exactly that session (or the settings panel when none). Cleared
+   * when the user opens the window through the tray.
+   */
+  let unreadSessionId: string | undefined
+  let unreadPending = false
   /**
    * The operating system is ending the session: the quit skips its confirmation. Windows sets it
    * on the definitive session-end message. macOS sets it on the power-off notification, which
@@ -472,9 +539,18 @@ async function main(): Promise<void> {
   // Copy comes from the same locale as the update prompts so the dialog
   // chrome and its content never mix languages.
   const showAbout = async (): Promise<void> => {
-    await ordinaryMessageBox({ type: 'info', title: locale.messages.aboutMenu, message: locale.messages.aboutProduct,
-      detail: formatDesktopMessage(locale.messages.aboutVersion, { version: app.getVersion() }),
-      buttons: [locale.messages.updateAcknowledge], cancelId: 0 })
+    // The homepage entry and branch note describe this Linux build's origin;
+    // other platforms keep the upstream About dialog unchanged.
+    const forkDetails = process.platform === 'linux'
+      ? ['', locale.messages.aboutHomepageLabel, locale.messages.aboutHomepageUrl, '', locale.messages.aboutBranchNote]
+      : []
+    const result = await ordinaryMessageBox({ type: 'info', title: locale.messages.aboutMenu, message: locale.messages.aboutProduct,
+      detail: [formatDesktopMessage(locale.messages.aboutVersion, { version: app.getVersion() }), ...forkDetails].join('\n'),
+      buttons: process.platform === 'linux'
+        ? [locale.messages.updateAcknowledge, locale.messages.aboutHomepageButton]
+        : [locale.messages.updateAcknowledge], cancelId: 0 })
+    // The homepage button opens the fork repository in the default browser.
+    if (process.platform === 'linux' && result.response === 1) void shell.openExternal(locale.messages.aboutHomepageUrl)
   }
   const commandManager = new DesktopCommandManager({
     resources: process.resourcesPath,
@@ -534,7 +610,8 @@ async function main(): Promise<void> {
   const backend = new DesktopBackendController((onFailure) => {
     const hostInspectPort = developmentHostInspectPort(development)
     const host = new DesktopHostProcess(resources.node, resources.dsh, activeProject,
-      hostInspectPort, { ...hostEnvironment, DSH_CLIENT_VERSION: desktopClientVersion() }, onFailure,
+      hostInspectPort, { ...hostEnvironment, DSH_CLIENT_VERSION: desktopClientVersion(),
+        ...(resources.standaloneNode !== undefined ? { DSH_STANDALONE_NODE: resources.standaloneNode } : {}) }, onFailure,
       primaryRuntime,
       resources, (next) => { platformView.setSession(next) }, (record) => {
         operationJournal ??= new OperationJournal(join(app.getPath('userData'), 'plugin-operations'), {
@@ -783,7 +860,6 @@ async function main(): Promise<void> {
     // A confirmation on a hidden window would go unseen, so it waits for the next show; the mandatory
     // flow keeps its own taskbar and Dock attention instead.
     if (!isMandatory()) await windowShown()
-    // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition -- A quit can begin while the show is awaited.
     if (quitting) return state
     return updates.install(version, revision)
   }
@@ -1002,6 +1078,157 @@ async function main(): Promise<void> {
     return configurationPrompt
   }
 
+  // The close-button behavior preference is owned by the Electron shell settings.
+  ipcMain.handle(DESKTOP_IPC.windowCloseBehaviorGet, (event) => {
+    assertProductSender(event)
+    return desktopSettings.window.closeBehavior
+  })
+  ipcMain.handle(DESKTOP_IPC.windowCloseBehaviorSet, async (event, behavior: unknown) => {
+    assertProductSender(event)
+    if (behavior !== 'hide' && behavior !== 'quit') throw new Error('desktop close behavior: must be hide or quit')
+    const next: DesktopCloseBehavior = behavior
+    desktopSettings = { ...desktopSettings, window: { closeBehavior: next } }
+    await writeDesktopSettings(app.getPath('userData'), desktopSettings)
+  })
+
+  ipcMain.handle(DESKTOP_IPC.notify, (event, input: unknown) => {
+    assertProductSender(event)
+    if (typeof input !== 'object' || input === null
+      || typeof (input as { title?: unknown }).title !== 'string'
+      || typeof (input as { body?: unknown }).body !== 'string'
+      || !(['approval', 'question', 'job', 'subagent', 'credential', 'remote', 'session', 'plugin', 'schedule', 'goal'] as const)
+        .includes((input as { category?: unknown }).category as DesktopNotificationCategory)) {
+      throw new Error('desktop notify: title, body and category are required')
+    }
+    const { category, title, body } = input as { category: DesktopNotificationCategory; title: string; body: string }
+    const sessionId = (input as { sessionId?: unknown }).sessionId
+    if (sessionId !== undefined && typeof sessionId !== 'string') {
+      throw new Error('desktop notify: sessionId must be a string')
+    }
+    if (!desktopSettings.notifications[category]) return
+    // Non-current-session filter: when off, notifications for sessions that
+    // are not the currently active tab are suppressed. Notifications without
+    // a sessionId always pass through. Default is ON.
+    const backgroundSession = !desktopSettings.notifications.nonCurrentSession
+      && sessionId !== undefined && currentSessionId !== undefined
+      && sessionId !== currentSessionId
+    if (backgroundSession) return
+    // The tray carries the unread state like QQ / WeChat: any notification
+    // that survives the category and session filters starts the blink and
+    // remembers its target session so a tray click jumps straight to that
+    // conversation (or the settings surface for session-less notices).
+    // This runs before the focus-redundancy check so the tray still blinks
+    // for the visible session while the window is focused.
+    unreadPending = true
+    if (sessionId !== undefined) unreadSessionId = sessionId
+    if (desktopSettings.notifications.trayFlash) tray?.flash()
+    // Focus mode: when "focused" is off (the default), the native popup for
+    // the session the user is already looking at is redundant — the in-app
+    // panel shows it. A background session, or a notice without a session
+    // (credential / remote-access), is not redundant while focused, so it
+    // still surfaces. Turning the switch on notifies regardless of focus.
+    const forVisibleSession = sessionId === undefined || currentSessionId === undefined
+      || sessionId === currentSessionId
+    const focusedOnVisible = !desktopSettings.notifications.focused
+      && forVisibleSession
+      && mainWindow !== undefined && !mainWindow.isDestroyed() && mainWindow.isFocused()
+    if (focusedOnVisible) return
+    const iconPath = process.platform === 'win32'
+      ? (development ? join(app.getAppPath(), 'resources', 'tray-windows.ico') : join(process.resourcesPath, 'tray.ico'))
+      : (development ? join(app.getAppPath(), 'resources', 'icon-tile.png') : join(process.resourcesPath, 'icon-tile.png'))
+    try {
+      const sticky = desktopSettings.notifications.sticky[category] ?? false
+      const notification = new Notification({ title, body, icon: iconPath, silent: false, timeoutType: sticky ? 'never' : 'default' })
+      // Clicking the notification focuses the window and tells the web UI
+      // which session's approval or question panel to surface.
+      notification.on('click', () => {
+        // Directly show and focus the window, bypassing focusPrimaryWindow's
+        // enteredWorkspace guard: a notification click must always reveal the
+        // window so the user can act on the pending approval or question.
+        if (mainWindow !== undefined && !mainWindow.isDestroyed()) {
+          if (mainWindow.isMinimized()) mainWindow.restore()
+          mainWindow.show()
+          mainWindow.focus()
+          mainWindow.webContents.send(DESKTOP_IPC.notifyAction, sessionId)
+        } else {
+          focusPrimaryWindow()
+        }
+      })
+      notification.show()
+    } catch (error) {
+      console.warn('desktop notification: unavailable', error)
+    }
+  })
+
+  // Notification category switches owned by the Electron shell settings.
+  ipcMain.handle(DESKTOP_IPC.notificationsGet, (event) => {
+    assertProductSender(event)
+    return desktopSettings.notifications satisfies DesktopNotificationSettings
+  })
+  ipcMain.handle(DESKTOP_IPC.notificationsSet, async (event, category: unknown, enabled: unknown) => {
+    assertProductSender(event)
+    const categories = ['approval', 'question', 'job', 'subagent', 'credential', 'remote', 'session', 'plugin', 'schedule', 'goal', 'focused', 'nonCurrentSession', 'trayFlash'] as const
+    const stickyCategories = ['approval', 'question', 'job', 'subagent', 'credential', 'remote', 'session', 'plugin', 'schedule', 'goal'] as const
+    // Accept sticky sub-keys as `sticky:<category>` so the same IPC handles them.
+    const isStickyKey = typeof category === 'string' && category.startsWith('sticky:')
+    const baseCategory = isStickyKey ? (category as string).slice(7) : category
+    if (!isStickyKey && !categories.includes(baseCategory as typeof categories[number])) {
+      throw new Error('desktop notifications: unknown category')
+    }
+    if (isStickyKey && !stickyCategories.includes(baseCategory as typeof stickyCategories[number])) {
+      throw new Error('desktop notifications: unknown sticky category')
+    }
+    if (typeof enabled !== 'boolean') throw new Error('desktop notifications: enabled must be true or false')
+    if (isStickyKey) {
+      const cat = baseCategory as DesktopNotificationCategory
+      desktopSettings = {
+        ...desktopSettings,
+        notifications: {
+          ...desktopSettings.notifications,
+          sticky: { ...desktopSettings.notifications.sticky, [cat]: enabled },
+        },
+      }
+    } else {
+      const typedCategory = baseCategory as DesktopNotificationCategory | 'focused' | 'nonCurrentSession' | 'trayFlash'
+      desktopSettings = {
+        ...desktopSettings,
+        notifications: { ...desktopSettings.notifications, [typedCategory]: enabled },
+      }
+      // Turning the tray-flash switch off while blinking stops the blink
+      // immediately so the icon does not keep pulsing against the user's wish.
+      if (typedCategory === 'trayFlash' && !enabled) tray?.stopFlash()
+    }
+    await writeDesktopSettings(app.getPath('userData'), desktopSettings)
+  })
+  ipcMain.handle(DESKTOP_IPC.notificationsReset, async (event) => {
+    assertProductSender(event)
+    tray?.stopFlash()
+    desktopSettings = {
+      ...desktopSettings,
+      notifications: { ...DESKTOP_NOTIFICATION_DEFAULTS },
+    }
+    await writeDesktopSettings(app.getPath('userData'), desktopSettings)
+    return desktopSettings.notifications satisfies DesktopNotificationSettings
+  })
+
+  // Track which session the UI is currently viewing so non-current-session
+  // filtering can suppress background-session notifications when disabled.
+  ipcMain.handle(DESKTOP_IPC.setCurrentSession, (event, sessionId: unknown) => {
+    assertProductSender(event)
+    if (sessionId !== undefined && typeof sessionId !== 'string') {
+      throw new Error('desktop set-current-session: sessionId must be a string or undefined')
+    }
+    currentSessionId = sessionId
+    // If the user switched to the session that owned the most recent unread
+    // notification, the blink has served its purpose: stop flashing and clear
+    // the unread marker so the tray icon stays steady.
+    if (unreadPending && sessionId !== undefined && sessionId === unreadSessionId) {
+      tray?.stopFlash()
+      unreadPending = false
+      unreadSessionId = undefined
+    }
+  })
+
   let promptOperation: Promise<void> | undefined
   let policyAuthenticationQueued = false
   /** Present check results only while their captured channel revision remains current. */
@@ -1042,7 +1269,7 @@ async function main(): Promise<void> {
       try {
         let state = updates.state
         const revision = updates.revision
-        if (manual || state.phase === 'idle' || (state.phase === 'error' && state.failedOperation === 'check')) {
+        if (manual || state.phase === 'idle' || state.phase === 'no_release' || state.phase === 'upstream_available' || (state.phase === 'error' && state.failedOperation === 'check')) {
           controller = new AbortController()
           ordinaryDialogs.add(controller)
           const parent = currentDialogWindow()
@@ -1062,6 +1289,17 @@ async function main(): Promise<void> {
             detail: formatDesktopMessage(locale.messages.updateCurrentDetail, { version: app.getVersion() }) })
           return
         }
+        if (state.phase === 'no_release') {
+          await ordinaryMessageBox({ type: 'info', title: locale.messages.updateCheckTitle,
+            message: locale.messages.updateNoRelease,
+            detail: formatDesktopMessage(locale.messages.updateCurrentDetail, { version: app.getVersion() }) })
+          return
+        }
+        if (state.phase === 'upstream_available') {
+          await ordinaryMessageBox({ type: 'info', title: locale.messages.updateCheckTitle,
+            message: formatDesktopMessage(locale.messages.updateUpstreamAvailable, { version: state.version ?? '', current: app.getVersion() }) })
+          return
+        }
         if (state.phase === 'ready' || (state.phase === 'error' && state.failedOperation === 'install')) {
           if (state.version !== undefined) {
             failedOperation = 'install'
@@ -1071,9 +1309,11 @@ async function main(): Promise<void> {
         }
         if (state.phase !== 'available' && !(state.phase === 'error' && state.failedOperation === 'download')) return
         if (manual) {
+          const notes = state.notes
           const result = await ordinaryMessageBox({ title: locale.messages.updateCheckTitle,
             message: formatDesktopMessage(locale.messages.updateAvailable, { version: state.version ?? '' }),
-            detail: locale.messages.updateDetail,
+            detail: notes === undefined ? locale.messages.updateDetail
+              : `${locale.messages.updateDetail}\n\n${locale.messages.updateNotes}\n${notes}`,
             buttons: [locale.messages.updateDownload], cancelId: 1 })
           if (result.response !== 0) return
         }
@@ -1201,9 +1441,9 @@ async function main(): Promise<void> {
       { role: 'unhide', label: currentDesktopLocale().messages.showAllApplications }, { type: 'separator' }]
     : []
   const applicationItems = (): MenuItemConstructorOptions[] => [
-    // Windows has no system About panel; Electron's fallback is a plain
-    // message box, so the shell shows its own dimmed dialog instead.
-    process.platform === 'win32'
+    // Windows and Linux have no native About panel; Electron's fallback is a
+    // plain message box, so the shell shows its own dimmed dialog instead.
+    process.platform === 'win32' || process.platform === 'linux'
       ? { label: currentDesktopLocale().messages.aboutMenu,
         click: () => { void showAbout().catch((error: unknown) => { console.error(error) }) } }
       : { label: currentDesktopLocale().messages.aboutMenu, role: 'about' },
@@ -1232,6 +1472,14 @@ async function main(): Promise<void> {
     devToolsF12Shortcut,
   ]
   const refreshApplicationMenu = (): void => {
+    // Linux draws its own caption menus and window controls inside the page,
+    // so the native menu bar is suppressed entirely: top-level `visible: false`
+    // items still render in the GTK menu bar and would leak hidden DevTools
+    // toggles into the caption.
+    if (process.platform === 'linux') {
+      Menu.setApplicationMenu(null)
+      return
+    }
     Menu.setApplicationMenu(Menu.buildFromTemplate(process.platform === 'win32'
       ? windowsDevToolsShortcuts : [{
         label: darwin ? app.name : currentDesktopLocale().messages.application,
@@ -1240,12 +1488,60 @@ async function main(): Promise<void> {
     tray?.relabel()
   }
   refreshApplicationMenu()
-  const trayIconPath = development ? join(app.getAppPath(), 'resources', 'tray-windows.ico') : join(process.resourcesPath, 'tray.ico')
-  if (process.platform === 'win32') {
+  // Native tray reminders: tell the user the app stays resident on startup
+  // and that closing hid it to the tray, whenever the close button hides.
+  const showTrayNotice = (body: string): void => {
+    const iconPath = process.platform === 'win32'
+      ? (development ? join(app.getAppPath(), 'resources', 'tray-windows.ico') : join(process.resourcesPath, 'tray.ico'))
+      : (development ? join(app.getAppPath(), 'resources', 'icon-tile.png') : join(process.resourcesPath, 'icon-tile.png'))
+    try {
+      new Notification({ title: locale.messages.aboutProduct, body, icon: iconPath, silent: true }).show()
+    } catch (error) {
+      console.warn('desktop tray notice: unavailable', error)
+    }
+  }
+  // Tray click: stop the unread blink, reveal the window, and hand the web UI
+  // the unread session so it opens that conversation (or the settings surface
+  // for session-less notices such as credential / remote-access requests).
+  const openFromTray = (): void => {
+    tray?.stopFlash()
+    const target = unreadSessionId
+    const pending = unreadPending
+    unreadPending = false
+    unreadSessionId = undefined
+    // Directly show and focus the window, bypassing focusPrimaryWindow's
+    // enteredWorkspace guard: a tray click must always reveal the window
+    // so the user can return to a hidden app or act on unread messages.
+    if (mainWindow !== undefined && !mainWindow.isDestroyed()) {
+      if (mainWindow.isMinimized()) mainWindow.restore()
+      mainWindow.show()
+      mainWindow.focus()
+    } else {
+      focusPrimaryWindow()
+    }
+    if (!pending || mainWindow === undefined || mainWindow.isDestroyed()) return
+    mainWindow.webContents.send(DESKTOP_IPC.notifyAction, target)
+  }
+  // Linux system trays require a raster icon; Windows uses its multi-size ICO.
+  // Linux tray icons: theme-appropriate transparent PNGs generated from SVG.
+  // Light theme → icon-dark.png (apps/web/public/favicon.svg, black #000)
+  // Dark theme → icon-light.png (apps/web/public/favicon-dark.svg, white #fff)
+  // The window, taskbar, and notification icons stay on the white-canvas
+  // icon-tile.png regardless of theme; only the tray follows the theme.
+  const trayIconPath = process.platform === 'win32'
+    ? (development ? join(app.getAppPath(), 'resources', 'tray-windows.ico') : join(process.resourcesPath, 'tray.ico'))
+    : (nativeTheme.shouldUseDarkColors
+      ? (development ? join(app.getAppPath(), 'resources', 'icon-light.png') : join(process.resourcesPath, 'icon-light.png'))
+      : (development ? join(app.getAppPath(), 'resources', 'icon-dark.png') : join(process.resourcesPath, 'icon-dark.png')))
+  if (process.platform === 'win32' || process.platform === 'linux') {
     // The tray is the way back to a hidden window; without it, relaunching the application still focuses it.
     try {
       tray = new DesktopTray({ iconPath: trayIconPath, locale: currentDesktopLocale,
-        open: () => { focusPrimaryWindow() }, quit: () => { app.quit() } })
+        // Linux notifications carry an unread session, so a click jumps straight
+        // to it; Windows keeps the upstream focus semantics. Both stay late-bound:
+        // the tray is created before focusPrimaryWindow receives its implementation.
+        open: () => { if (process.platform === 'linux') openFromTray(); else focusPrimaryWindow() },
+        quit: () => { app.quit() } })
     } catch (error) { console.warn('desktop tray: unavailable', error) }
   }
   const backgroundNotice = process.platform === 'win32'
@@ -1265,7 +1561,7 @@ async function main(): Promise<void> {
     ...(process.platform === 'win32' ? { icon: nativeImage.createFromPath(trayIconPath) } : {}),
   })
 
-  if (process.platform === 'win32') {
+  if (process.platform === 'win32' || process.platform === 'linux') {
     ipcMain.handle(DESKTOP_IPC.windowsMenu, (event, name: unknown, x: unknown, y: unknown) => {
       assertDesktopSender(event, ['app'])
       if (mainWindow === undefined || event.sender !== mainWindow.webContents
@@ -1298,6 +1594,29 @@ async function main(): Promise<void> {
         Menu.buildFromTemplate(items).popup({ window, x: Math.round(x * zoom), y: Math.round(y * zoom), callback: resolve })
       })
     })
+    if (process.platform === 'linux') {
+      // Linux hides native chrome entirely, so the caption buttons drive the
+      // window state directly through these handlers.
+      ipcMain.handle(DESKTOP_IPC.windowMinimize, (event) => {
+        assertDesktopSender(event, ['app'])
+        if (mainWindow === undefined || event.sender !== mainWindow.webContents
+          || event.senderFrame !== mainWindow.webContents.mainFrame) return
+        mainWindow.minimize()
+      })
+      ipcMain.handle(DESKTOP_IPC.windowToggleMaximize, (event) => {
+        assertDesktopSender(event, ['app'])
+        if (mainWindow === undefined || event.sender !== mainWindow.webContents
+          || event.senderFrame !== mainWindow.webContents.mainFrame) return
+        if (mainWindow.isMaximized()) mainWindow.unmaximize()
+        else mainWindow.maximize()
+      })
+      ipcMain.handle(DESKTOP_IPC.windowClose, (event) => {
+        assertDesktopSender(event, ['app'])
+        if (mainWindow === undefined || event.sender !== mainWindow.webContents
+          || event.senderFrame !== mainWindow.webContents.mainFrame) return
+        mainWindow.close()
+      })
+    }
     ipcMain.on(DESKTOP_IPC.windowsAppearance, (event, _language: unknown, color: unknown, symbolColor: unknown) => {
       if (mainWindow === undefined || event.sender !== mainWindow.webContents
         || event.senderFrame !== mainWindow.webContents.mainFrame) return
@@ -1325,13 +1644,22 @@ async function main(): Promise<void> {
     browserGuests.bind(window, (guest, name) => shortcuts.attachGuest(window, guest, name))
     shortcuts.attach(window)
     window.on('focus', automaticCheck)
-    // Closing hides: the page and the Host keep running, and the next show resumes the same document.
+    // Closing hides by default: the page and the Host keep running, and the next show resumes the same document.
+    // The General settings close-behavior option can turn the close button into a real quit instead.
     window.on('close', (event) => {
       if (quitting || shellInstallerOwnsQuit || sessionEnding) return
       event.preventDefault()
       if (updateDialog.isOpen) { updateDialog.focus(); return }
+      if (desktopSettings.window.closeBehavior === 'quit') {
+        app.quit()
+        return
+      }
       const hide = (): void => {
-        if (!quitting && !shellInstallerOwnsQuit && !sessionEnding && !window.isDestroyed()) hideMainWindow(window)
+        if (!quitting && !shellInstallerOwnsQuit && !sessionEnding && !window.isDestroyed()) {
+          hideMainWindow(window)
+          // Tell the user the window hid to the tray instead of quitting.
+          if (tray !== undefined) showTrayNotice(locale.messages.trayHiddenNotice)
+        }
       }
       if (backgroundNotice === undefined) hide()
       else backgroundNotice.close(hide)

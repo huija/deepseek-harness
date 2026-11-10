@@ -1,5 +1,5 @@
 import { EventEmitter } from 'node:events'
-import { afterEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { AppUpdater } from 'electron-updater'
 import { DESKTOP_HOST_PROTOCOL_VERSION } from '../src/host-protocol.ts'
 import { parseDesktopRelease } from '../src/release.ts'
@@ -46,6 +46,14 @@ describe('desktop release metadata', () => {
 
 const coordinators: InstanceType<typeof DesktopUpdateCoordinator>[] = []
 afterEach(() => { for (const item of coordinators.splice(0)) item.dispose() })
+
+/**
+ * Upstream fallback fetch. The default answers with an older release so the
+ * dual-level check is a no-op for single-feed scenarios; offline tests reject it.
+ */
+const upstreamFetch = vi.fn(async () => new Response(JSON.stringify({ tag_name: 'dsh-v0.9.0' }), { status: 200 }))
+beforeEach(() => { vi.stubGlobal('fetch', upstreamFetch) })
+afterEach(() => { vi.unstubAllGlobals(); upstreamFetch.mockClear() })
 
 function fixture(channel: 'nightly' | 'stable' = 'nightly', version = '1.1.0-alpha.1', discard?: (updater: AppUpdater) => Promise<void>) {
   const events = new EventEmitter()
@@ -169,6 +177,7 @@ describe('desktop update coordinator', () => {
 
   it('keeps automatic failures silent and exposes a manual caller joining the same check', async () => {
     const f = fixture()
+    upstreamFetch.mockRejectedValue(new Error('offline'))
     f.checkForUpdates.mockRejectedValue(new Error('offline'))
     expect(await f.coordinator.check()).toMatchObject({ phase: 'error', failedOperation: 'check' })
     expect(f.states).toEqual([])

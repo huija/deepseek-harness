@@ -11,6 +11,8 @@ const NETWORK_FAILURE = /\b(?:ERR_CONNECTION_CLOSED|ERR_CONNECTION_RESET|ERR_INT
  */
 function desktopUpdateFailureKind(state: DesktopUpdateState): DesktopUpdateFailureKind {
   if (state.failedOperation === 'configuration') return 'configuration'
+  if (state.phase === 'no_release') return 'no-release'
+  if (state.phase === 'upstream_available') return 'upstream-available'
   if (state.failedOperation === 'install' && state.preparationFailure !== undefined) return state.preparationFailure
   if (state.failedOperation === 'download' && state.downloadFailure !== undefined) return `download-${state.downloadFailure}`
   const operation = state.failedOperation ?? 'install'
@@ -40,6 +42,8 @@ export function desktopUpdateErrorSummary(state: DesktopUpdateState, messages: D
     'tasks-changed': messages.updateTasksChanged,
     'tasks-unavailable': messages.updateTasksUnavailable,
     'fullscreen-timeout': messages.updateFullscreenTimeout,
+    'no-release': messages.updateNoRelease,
+    'upstream-available': messages.updateUpstreamAvailable,
   }
   return summaries[kind]
 }

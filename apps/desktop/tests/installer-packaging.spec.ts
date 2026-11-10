@@ -124,4 +124,26 @@ describe('installer preparation preserves application dependencies', () => {
     const packaged = new Set(config.files.filter((entry): entry is string => typeof entry === 'string'))
     for (const name of referenced) expect(packaged.has(`lib/${name}`)).toBe(true)
   })
+
+  it('packages the white-canvas window icon and both tray themes on Linux', async () => {
+    const { createElectronBuilderConfig } = await import('../scripts/electron-builder-config.mjs')
+    const config = createElectronBuilderConfig({
+      DSH_DESKTOP_APP_ID: 'com.example.installer',
+      DSH_DESKTOP_AUTO_UPDATE_ENV: 'production',
+      DSH_DESKTOP_MANDATORY_UPDATE_PROD_ORIGIN: 'https://policy.example.com',
+      DSH_DESKTOP_TARGET_PLATFORM: 'linux',
+      DSH_DESKTOP_TARGET_ARCH: 'x64',
+    }, 'linux', 'x64')
+    const packaged = config.extraResources.map(resource => resource.to)
+    // The window, taskbar, and notification icons reuse the white-canvas artwork.
+    expect(packaged).toContain('icon-tile.png')
+    // The tray keeps its theme-driven black and white whales.
+    expect(packaged).toContain('icon-dark.png')
+    expect(packaged).toContain('icon-light.png')
+    expect(packaged).toContain('set-net-wm-icon')
+    // The colorful whale lost every consumer when the shell moved to the tile.
+    expect(packaged).not.toContain('icon-color.png')
+    // electron-builder installs one launcher bitmap per file in this directory.
+    expect(config.linux.icon).toMatch(/resources[\\/]icons$/u)
+  })
 })

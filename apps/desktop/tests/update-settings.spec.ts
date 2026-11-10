@@ -57,7 +57,9 @@ it('updates the document initialized by shell settings without losing the popup 
   expect((await readDesktopSettings(root)).updates.allowTestAuthPopupWindow).toBe(false)
   const settings = new DesktopUpdateSettings(root, 'stable')
   await settings.save('nightly')
-  expect(JSON.parse(await readFile(settings.path, 'utf8'))).toEqual({
+  // The document is shared with the shell settings (window, notifications); the channel
+  // write must patch its own field and leave every other field, popup preference included, intact.
+  expect(JSON.parse(await readFile(settings.path, 'utf8'))).toMatchObject({
     updates: { allowTestAuthPopupWindow: false, channel: 'nightly' },
   })
   expect((await readDesktopSettings(root)).updates.allowTestAuthPopupWindow).toBe(false)

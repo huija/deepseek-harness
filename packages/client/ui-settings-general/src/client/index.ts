@@ -13,6 +13,13 @@ import type { Context as ClientContext } from '@deepseek-ai/cordis'
 import type {} from '@deepseek-ai/dsh-api-remote-access/client'
 // Type-only: pulls the ctx.remote merge and its fixed Host facts.
 import type {} from '@deepseek-ai/dsh-api-remotes/client'
+import type {} from '@deepseek-ai/dsh-api-session-controller/remote-events'
+// Type-only: pulls the ctx.sessions service merge (current-session tracking).
+import type {} from '@deepseek-ai/dsh-api-session-controller/client'
+import type {} from '@deepseek-ai/dsh-subagent'
+import type {} from '@deepseek-ai/dsh-goal'
+// Type-only: pulls the connection/remote-requested Cordis event declaration.
+import type {} from '@deepseek-ai/dsh-client-connection/src/remote-connection-request.ts'
 import type { ConnectionHandle } from '@deepseek-ai/dsh-client-connection/client'
 // Type-only: pulls the ctx.modules merge.
 import type {} from '@deepseek-ai/dsh-client-modules/client'
@@ -34,7 +41,8 @@ import type { ShortcutCommandId } from '@deepseek-ai/dsh-client-shortcuts/client
 import { createSettingsShellStore } from './shell-store.ts'
 import { SettingsRoot } from './SettingsRoot.tsx'
 import { DesktopUpdateBadge } from './DesktopUpdateIndicator.tsx'
-import type { DesktopUpdateBridge } from '../types.ts'
+import type { DesktopCloseBehaviorBridge, DesktopNotificationsBridge, DesktopUpdateBridge } from '../types.ts'
+import { notifyDesktop } from '@deepseek-ai/dsh-client-ui-primitives'
 import { DesktopChannelSource } from './desktop-channel-source.ts'
 import { DesktopChannelRow, DesktopChannelToast } from './DesktopChannelRow.tsx'
 import { DesktopUpdateSource } from './desktop-update-source.ts'
@@ -42,6 +50,8 @@ import { CloseLabel, HeaderContent, TriggerContent } from './chrome.tsx'
 import { GeneralSection } from './GeneralSection.tsx'
 import { CurrentVersionRow } from './CurrentVersionRow.tsx'
 import { DeveloperToolsRow, type DeveloperToolsRowInjected } from './DeveloperToolsRow.tsx'
+import { CloseWindowBehaviorRow, type CloseWindowBehaviorRowInjected } from './CloseWindowBehaviorRow.tsx'
+import { DesktopNotificationsRow, type DesktopNotificationsRowInjected } from './DesktopNotificationsRow.tsx'
 import { SettingsDocumentAction } from './SettingsDocumentAction.tsx'
 import type { SettingsDocumentActionInjected } from './SettingsDocumentAction.tsx'
 import { SettingsDocumentStore } from './settings-document-store.ts'
@@ -56,6 +66,8 @@ export type {
 } from './GeneralSection.tsx'
 export type { SettingsDocumentActionInjected, SettingsDocumentActionProps } from './SettingsDocumentAction.tsx'
 export type { SettingsDocumentState } from './settings-document-store.ts'
+export type { CloseWindowBehaviorRowInjected } from './CloseWindowBehaviorRow.tsx'
+export type { DesktopNotificationsRowInjected } from './DesktopNotificationsRow.tsx'
 export { SettingsDocumentStore } from './settings-document-store.ts'
 export type { SettingsKey } from './locales.ts'
 
@@ -74,7 +86,7 @@ const NS = 'settings'
  * ui-settings' apply, whose activation order relative to this one is NOT
  * constrained; registrations depend on their slots through `slots.inject()`.
  */
-export const inject = ['slots', 'locale', 'connection', 'remote', 'remote.settings', 'configForms', 'shortcuts', 'modules', 'remoteAccess']
+export const inject = ['slots', 'locale', 'connection', 'remote', 'remote.settings', 'configForms', 'shortcuts', 'modules', 'remoteAccess', 'sessions']
 
 /**
  * Register the `settings` dictionaries, the chrome content, and the General
@@ -103,7 +115,16 @@ export function apply(ctx: ClientContext): void {
   }, CurrentVersionRow))
   ctx.effect(() => ctx.locale.register(NS, { zh, en, ja, es, fr, de, ru, pt }), 'ui-settings-general: dictionaries')
   const connection = ctx.get('connection') as ConnectionHandle
-  const carrier = (globalThis as typeof globalThis & { dshDesktop?: { protocolVersion: number; updates?: DesktopUpdateBridge } }).dshDesktop
+  const carrier = (globalThis as typeof globalThis & {
+    dshDesktop?: {
+      protocolVersion: number
+      updates?: DesktopUpdateBridge
+      closeBehavior?: DesktopCloseBehaviorBridge
+      notifications?: DesktopNotificationsBridge
+      setCurrentSession?: (sessionId: string | undefined) => Promise<void>
+      onNotifyAction?: (listener: (sessionId: string | undefined) => void) => () => void
+    }
+  }).dshDesktop
   const desktopUpdate = new DesktopUpdateSource(carrier?.protocolVersion === 1 ? carrier.updates : undefined)
   ctx.effect(() => () => { desktopUpdate.dispose() }, 'ui-settings-general: desktop update carrier')
   const channelBridge = carrier?.protocolVersion === 1 ? carrier.updates?.channels : undefined
@@ -121,6 +142,146 @@ export function apply(ctx: ClientContext): void {
     }, DesktopChannelToast))
   }
 
+  // Track which session the UI is currently viewing so the shell's
+  // non-current-session notification filter can suppress background-session
+  // notifications. The session list's mainView-retained row is the active tab,
+  // matching the layout's DocumentTitle selection.
+  if (carrier?.protocolVersion === 1 && carrier.setCurrentSession !== undefined) {
+    type SessionListLike = {
+      getSnapshot(): { byId: Record<string, { retainedBy: { mainView?: number } }> }
+      subscribe(listener: () => void): () => void
+    }
+    const sessions = ctx.get('sessions') as { list: SessionListLike } | undefined
+    if (sessions !== undefined) {
+      const sync = (): void => {
+        const snapshot = sessions.list.getSnapshot()
+        const currentId = Object.entries(snapshot.byId)
+          .find(([, session]) => (session.retainedBy.mainView ?? 0) > 0)?.[0]
+        void carrier.setCurrentSession?.(currentId)
+      }
+      sync()
+      const stop = sessions.list.subscribe(() => { sync() })
+      ctx.effect(() => () => { stop() }, 'ui-settings-general: current-session sync')
+    }
+  }
+
+  // Notification triggers for categories without a feature-owned hook: the
+  // model needing credentials or a sign-in, the remote-connection request the
+  // Host admits, and the completion of a delegated subagent.
+  ctx.remote.$on('subagent/finished', (info) => {
+    const value = info as { provider?: string; id?: string }
+    const providerZh = value.provider ?? '子代理'
+    const providerEn = value.provider ?? 'Subagent'
+    // Subagent id is the child session id, not the parent the user is viewing,
+    // so it must not be passed as sessionId — otherwise it never matches
+    // currentSessionId and the non-current-session / focus filters let it
+    // through even when they should not. Treat it as a session-less notice.
+    notifyDesktop({
+      category: 'subagent',
+      title: { zh: '子代理结束', en: 'Subagent finished' },
+      body: { zh: providerZh + ' 已完成', en: providerEn + ' finished' },
+    })
+  })
+  ctx.remote.$on('deepseek-account/model-sign-in-required', () => {
+    notifyDesktop({
+      category: 'credential',
+      title: { zh: '凭证需要', en: 'Credentials needed' },
+      body: { zh: '模型需要登录，请提供凭证', en: 'The model needs to sign in — please provide credentials' },
+    })
+  })
+  // The remote category is driven by the Host's own remote-connection
+  // request event: a caller outside this machine asked to connect and was
+  // admitted. A new local session, a subagent, or any other local activity
+  // never produces this event, so it cannot stand in for a remote request.
+  ctx.remote.$on('connection/remote-requested', (request) => {
+    const value = request as { authority?: string }
+    const authority = value.authority ?? ''
+    notifyDesktop({
+      category: 'remote',
+      title: { zh: '远程接入请求', en: 'Remote access request' },
+      body: {
+        zh: authority + ' 请求接入本机，请确认是否允许',
+        en: authority + ' asked to connect to this machine - please confirm',
+      },
+    })
+  })
+  // The session category is its own switch, driven by the real new-session
+  // event. Subagent sessions are filtered out: they are spawned by the model
+  // itself and the subagent category already reports them.
+  ctx.remote.$on('api-session/added', (summary) => {
+    const value = summary as { sessionId?: string; origin?: 'subagent' }
+    if (value.origin === 'subagent' || value.sessionId === undefined) return
+    notifyDesktop({
+      category: 'session',
+      title: { zh: '新会话', en: 'New session' },
+      body: { zh: '已创建新的会话', en: 'A new session has been created' },
+      sessionId: value.sessionId,
+    })
+  })
+  ctx.remote.$on('goal/completed-or-blocked', (notice) => {
+    const value = notice as { sessionId?: string; operation?: string; objective?: string }
+    const zhOperation = value.operation === 'complete' ? '已完成' : '已阻塞'
+    const enOperation = value.operation === 'complete' ? 'completed' : 'blocked'
+    const objective = value.objective ?? ''
+    notifyDesktop({
+      category: 'goal',
+      title: { zh: 'Goal ' + zhOperation, en: 'Goal ' + enOperation },
+      body: {
+        zh: 'Goal 目标' + (objective ? `"${objective}"` : '') + zhOperation,
+        en: 'Goal ' + (objective ? `"${objective}" ` : '') + enOperation,
+      },
+      sessionId: value.sessionId,
+    })
+  })
+  ctx.remote.$on('schedule/reminder-delivered', (notice) => {
+    const value = notice as { sessionId?: string; count?: number }
+    const count = value.count ?? 1
+    const zhBody = count > 1 ? `${count} 个定时任务已触发` : '定时提醒已触发'
+    const enBody = count > 1 ? `${count} scheduled tasks fired` : 'Scheduled reminder fired'
+    notifyDesktop({
+      category: 'schedule',
+      title: { zh: '定时提醒到期', en: 'Schedule reminder due' },
+      body: { zh: zhBody, en: enBody },
+      sessionId: value.sessionId,
+    })
+  })
+
+  // Notification clicks surface the owning session or the relevant settings
+  // view. The shell already focuses the window; here we switch the workspace
+  // to that session so its pending approval or question panel is visible.
+  // uiWorkspace is provided by ui-workspace which loads after this plugin, so
+  // read it at click time (runtime) rather than caching it at apply time.
+  const stopNotifyAction = carrier?.protocolVersion === 1
+    ? carrier.onNotifyAction?.((sessionId) => {
+      if (sessionId !== undefined) {
+        const uiWorkspace = ctx.get('uiWorkspace') as { openSession(target: string): void } | undefined
+        uiWorkspace?.openSession(sessionId)
+        return
+      }
+      // No session attached: for credential/remote notices, open settings so
+      // the user can act on the request.
+      const shellHandle = createSettingsShellStore()
+      const shellInstance = shellHandle.create()
+      shellInstance.actions.open()
+    })
+    : undefined
+  ctx.effect(() => () => { stopNotifyAction?.() }, 'ui-settings-general: notification action carrier')
+  // The close-button behavior lives in the Electron shell settings; Web builds hide the row.
+  ctx.slots.inject('settings.general.item', () => ctx.slots.register({
+    name: 'settings.general.item', id: 'close-behavior', order: 110, locale: NS,
+    inject: (): CloseWindowBehaviorRowInjected => ({
+      ...(carrier?.protocolVersion === 1 && carrier.closeBehavior !== undefined
+        ? { bridge: carrier.closeBehavior } : {}),
+    }),
+  }, CloseWindowBehaviorRow))
+  // Desktop notification category switches; Web builds hide the row.
+  ctx.slots.inject('settings.general.item', () => ctx.slots.register({
+    name: 'settings.general.item', id: 'desktop-notifications', order: 120, locale: NS,
+    inject: (): DesktopNotificationsRowInjected => ({
+      ...(carrier?.protocolVersion === 1 && carrier.notifications !== undefined
+        ? { bridge: carrier.notifications } : {}),
+    }),
+  }, DesktopNotificationsRow))
   ctx.slots.inject('sidebar.toggle.badge', () => ctx.slots.register({
     name: 'sidebar.toggle.badge', locale: NS,
     inject: () => ({ hooks: { desktopUpdate: desktopUpdate.store, connectionState: connection.state } }),

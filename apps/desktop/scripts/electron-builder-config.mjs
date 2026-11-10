@@ -1,9 +1,9 @@
 import { readInstallerLocales, renderInstallerStrings } from './installer-locales.mjs'
 import { officePackageDirectories } from '../../../scripts/libreoffice-packages.mjs'
 import { X509Certificate } from 'node:crypto'
-import { readFileSync } from 'node:fs'
+import { readFileSync, existsSync, mkdirSync, copyFileSync, readdirSync } from 'node:fs'
 import { readFile, writeFile } from 'node:fs/promises'
-import { join, relative, sep } from 'node:path'
+import { join, relative, sep, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
@@ -34,6 +34,43 @@ import {
   verifyMacOSAppUpdateConfig,
   writeMacOSAppUpdateConfig,
 } from './macos-app-update-config.mjs'
+
+/** Environment variable overriding the Linux auto-update feed base URL. */
+export const DESKTOP_LINUX_UPDATE_ENV = 'DSH_DESKTOP_LINUX_UPDATE_URL'
+
+/** Environment variable overriding the release notes embedded in Linux update metadata. */
+export const DESKTOP_LINUX_RELEASE_NOTES_ENV = 'DSH_DESKTOP_LINUX_RELEASE_NOTES'
+
+/** Default release notes embedded in the Linux update feed metadata. */
+export const LINUX_UPDATE_RELEASE_NOTES = `linux-custom-titlebar 分支更新
+
+基于官方进行分支优化修改，适配 Deepin v25 系统并测试通过，其它系统需自行测试。
+
+- 自定义标题栏：「应用 / 编辑」菜单内嵌标题栏，节约屏幕高度
+- 去除原生菜单栏，移除多余的 Toggle Developer Tools 调试项
+- 系统托盘：窗口关闭后驻留后台，托盘图标可「显示窗口 / 退出」；收到通知时图标闪烁（可开关）
+- 关闭行为可配置：点击 X 后「隐藏到托盘（默认）/ 退出应用」
+- 桌面通知（10 类）：审核请求、模型提问、后台任务、子代理结束、凭证需要、远程接入、新会话、插件操作、定时提醒、Goal 状态；每类独立开关，含「聚焦时不弹出」「非当前会话不弹出」「托盘闪烁」全局开关
+- 自动更新：AppImage 自动下载安装`
+
+/**
+ * Resolve the Linux auto-update feed: the fork's stable GitHub release
+ * directory. A fixed tag (not a versioned one) is used so every installed
+ * build always sees the newest metadata; the workflow refreshes that release
+ * on each build.
+ * @param {NodeJS.ProcessEnv} env - Packaging environment.
+ * @param {string} version - Desktop semantic version (kept for diagnostics).
+ * @returns {{ channel: 'nightly', publicUrl: string }} Linux updater feed.
+ */
+export function resolveDesktopLinuxUpdateConfig(env, version) {
+  const url = env[DESKTOP_LINUX_UPDATE_ENV]?.trim()
+  return {
+    channel: 'nightly',
+    publicUrl: url === undefined || url === ''
+      ? 'https://github.com/yaoyingkeji/deepseek-harness/releases/download/linux-latest/'
+      : url,
+  }
+}
 
 /**
  * Create electron-builder configuration from one release environment.
@@ -79,7 +116,14 @@ export function createElectronBuilderConfig(
     `**/node_modules/@deepseek-ai/libreoffice-kit-${resolvedPlatform}-${resolvedArch}/**/*`,
     // LaunchServices opens the Computer Use helper as an application, so every file of its bundles stays on disk.
     // Both architectures ship: they form one notarized payload whose manifest staging verifies as a whole.
-    '**/node_modules/@deepseek-ai/dsh-experimental-cua-macos/native/bin/**/*']
+    '**/node_modules/@deepseek-ai/dsh-experimental-cua-macos/native/bin/**/*',
+    // sharp JS 依赖解包，让独立 Node 子进程能直接 require（不读 asar）
+    '**/node_modules/sharp/**',
+    '**/node_modules/detect-libc/**',
+    '**/node_modules/semver/**',
+    '**/node_modules/@img/**',
+    // sharp worker 脚本必须解包，独立 Node 不能读 asar
+    '**/node_modules/@deepseek-ai/dsh-attachment-local/lib/**']
   const windowsSigner = packagesWindows && !unsigned
     ? createWindowsTokenSigner({
         certificateFile: env.DSH_DESKTOP_WINDOWS_CER_FILE,
@@ -99,12 +143,15 @@ export function createElectronBuilderConfig(
   if (windowsSigner !== undefined) {
     installWindowsNsisBootstrapSigner({ sign: windowsSigner })
   }
-  const update = unsigned ? undefined : resolveDesktopAutoUpdateConfig(env, resolvedPlatform, resolvedArch)
-  if (preparedRuntime !== undefined) buildPaths.dsh = preparedRuntime
   // electron-builder merges extraMetadata into the packaged manifest, so a build version here reaches
   // the artifact names, the update feed, and the installed app.getVersion() the updater compares against.
   const productVersion = JSON.parse(readFileSync(fileURLToPath(new URL('../package.json', import.meta.url)), 'utf8')).version
   const buildVersion = resolveDesktopBuildVersion(env, productVersion)
+  const update = unsigned ? undefined : resolvedPlatform === 'linux'
+    ? resolveDesktopLinuxUpdateConfig(env, productVersion)
+    : resolveDesktopAutoUpdateConfig(env, resolvedPlatform, resolvedArch)
+  if (preparedRuntime !== undefined) buildPaths.dsh = preparedRuntime
+  if (update?.channel === 'latest' && buildVersion.includes('-')) throw new Error('desktop package: latest requires a stable version')
   const packaged = resolveDesktopBuildCommit(env)
   return {
     appId,
@@ -112,13 +159,22 @@ export function createElectronBuilderConfig(
     extraMetadata: {
       dshDesktopAppId: appId,
       dshDesktopUpdateChannel: update?.channel ?? 'nightly',
-      ...(policy === undefined ? {} : { dshMandatoryUpdatePolicy: policy }),
+      ...(policy === undefined || resolvedPlatform === 'linux' ? {} : { dshMandatoryUpdatePolicy: policy }),
       ...buildVersion === productVersion ? {} : { version: buildVersion },
       ...packaged === undefined ? {} : { dshBuildCommit: packaged.commit, dshBuildDirty: packaged.dirty },
     },
     productName: 'DeepSeek Harness',
     // The default copyright uses author.name; this line names the product instead.
     copyright: `Copyright © ${new Date().getFullYear()} \${productName}`,
+    // Embed the branch release notes in the Linux update feed metadata so the
+    // update prompt can show what changed in each release. Official platform
+    // feeds keep master's metadata untouched.
+    ...(update === undefined || resolvedPlatform !== 'linux' ? {} : {
+      releaseInfo: {
+        releaseName: `DeepSeek Harness ${productVersion}`,
+        releaseNotes: env[DESKTOP_LINUX_RELEASE_NOTES_ENV]?.trim() || LINUX_UPDATE_RELEASE_NOTES,
+      },
+    }),
     // Unsigned builds carry their own suffix so a shared file can never pass for a release artifact.
     artifactName: `deepseek-harness-\${version}-\${os}-\${arch}${output.suffix}.\${ext}`,
     directories: { output: output.directory },
@@ -160,6 +216,19 @@ export function createElectronBuilderConfig(
     extraResources: [
       { from: buildPaths.runtime, to: 'runtime' },
       { from: fileURLToPath(new URL('../resources/icon-windows.png', import.meta.url)), to: 'icon.png' },
+      // Linux: PNGs rendered from SVG by scripts/render-linux-icons.ts.
+      // icon-tile.png: white-canvas artwork for the window, taskbar,
+      //   and notifications
+      // icon-dark.png: black whale for the tray in light theme
+      // icon-light.png: white whale for the tray in dark theme
+      ...(resolvedPlatform === 'linux' ? [
+        { from: fileURLToPath(new URL('../resources/icon-tile.png', import.meta.url)), to: 'icon-tile.png' },
+        { from: fileURLToPath(new URL('../resources/icon-dark.png', import.meta.url)), to: 'icon-dark.png' },
+        { from: fileURLToPath(new URL('../resources/icon-light.png', import.meta.url)), to: 'icon-light.png' },
+        // Statically-linked X11 tool: Electron 44 setIcon() does not set
+        // _NET_WM_ICON on Linux, so we call this after window creation.
+        { from: fileURLToPath(new URL('../resources/native/set-net-wm-icon', import.meta.url)), to: 'set-net-wm-icon' },
+      ] : []),
       // Windows tray bitmaps; macOS keeps the Dock and ships no menu bar icon.
       ...(packagesWindows ? [{ from: fileURLToPath(new URL('../resources/tray-windows.ico', import.meta.url)), to: 'tray.ico' }] : []),
     ],
@@ -214,6 +283,24 @@ export function createElectronBuilderConfig(
         preparedRuntimeVersion ?? productVersion, { platform: resolvedPlatform, arch: resolvedArch })
       // Unsigned Windows builds skip electron-builder's afterSign hook.
       if (packagesWindows && unsigned) await verifyWindowsAsarUnpack(buildPaths.dsh, resourcesDir, windowsCode)
+      // Linux: 确保 @img 包的 package.json 文件被解包。
+      // electron-builder 的 glob 匹配 .node/.so 文件但不复制 package.json，
+      // 导致独立 Node 的 require() 无法解析 @img/sharp-linux-x64。
+      if (resolvedPlatform === 'linux') {
+        const asarUnpackedDir = join(resourcesDir, 'app.asar.unpacked')
+        const imgScopeDir = join(asarUnpackedDir, 'dsh', 'node_modules', '@img')
+        const imgSrcDir = join(buildPaths.dsh, 'node_modules', '@img')
+        if (existsSync(imgSrcDir)) {
+          for (const pkgName of readdirSync(imgSrcDir)) {
+            const srcPkgJson = join(imgSrcDir, pkgName, 'package.json')
+            const destPkgJson = join(imgScopeDir, pkgName, 'package.json')
+            if (existsSync(srcPkgJson) && !existsSync(destPkgJson)) {
+              mkdirSync(dirname(destPkgJson), { recursive: true })
+              copyFileSync(srcPkgJson, destPkgJson)
+            }
+          }
+        }
+      }
     },
     afterSign: async context => {
       if (windowsSigner !== undefined) {
@@ -255,8 +342,17 @@ export function createElectronBuilderConfig(
       target: ['nsis'],
     },
     linux: {
+      icon: fileURLToPath(new URL('../resources/icons', import.meta.url)),
       category: 'Development',
-      target: ['AppImage'],
+      maintainer: 'DeepSeek AI',
+      synopsis: 'Desktop shell for a bundled dsh runtime and external plugins',
+      executableName: 'deepseek-harness',
+      desktop: {
+        entry: {
+          StartupWMClass: 'deepseek-ai-dsh-desktop',
+        },
+      },
+      target: ['AppImage', 'deb'],
     },
     nsis: {
       uninstallDisplayName: '${productName}',

@@ -9,9 +9,16 @@ vi.mock('electron-updater', () => ({ default: { autoUpdater: {} } }))
 const { DesktopUpdateCoordinator } = await import('../src/update-coordinator.ts')
 
 const cleanup: (() => void)[] = []
-beforeEach(() => { vi.useFakeTimers() })
+/**
+ * Upstream fallback fetch for the dual-level check. The default answers with an
+ * older release; offline tests reject it so neither feed can be read.
+ */
+const upstreamFetch = vi.fn(async () => new Response(JSON.stringify({ tag_name: 'dsh-v0.9.0' }), { status: 200 }))
+beforeEach(() => { vi.useFakeTimers(); vi.stubGlobal('fetch', upstreamFetch) })
 afterEach(() => {
   for (const dispose of cleanup.splice(0)) dispose()
+  vi.unstubAllGlobals()
+  upstreamFetch.mockClear()
   vi.useRealTimers()
   vi.restoreAllMocks()
 })
@@ -35,6 +42,7 @@ function fixture(jitter = 0, random = () => 0.5) {
 describe('ordinary update polling', () => {
   it('checks immediately, doubles failed delays up to the cap, and resets after success', async () => {
     const f = fixture()
+    upstreamFetch.mockRejectedValue(new Error('offline'))
     f.checkForUpdates.mockRejectedValue(new Error('offline'))
     await f.schedule.check()
     expect(f.checkForUpdates).toHaveBeenCalledTimes(1)
@@ -63,6 +71,7 @@ describe('ordinary update polling', () => {
       expect(f.checkForUpdates).toHaveBeenCalledTimes(1)
       await vi.advanceTimersByTimeAsync(1)
       expect(f.checkForUpdates).toHaveBeenCalledTimes(2)
+      upstreamFetch.mockRejectedValue(new Error('offline'))
       f.checkForUpdates.mockRejectedValue(new Error('offline'))
       await f.schedule.check(true)
       await f.schedule.check(true)

@@ -1,0 +1,194 @@
+/** General Settings control for the desktop notification category switches. */
+import { useState } from 'react'
+import { useBridgeValue } from './use-bridge-value.ts'
+import { Switch } from '@deepseek-ai/dsh-client-ui-primitives'
+import type { InjectFace, PropsLocale, PropsRuntime } from '@deepseek-ai/dsh-client-ui-slots'
+import {
+  DESKTOP_NOTIFICATION_RECOMMENDED_DISABLED,
+  type DesktopNotificationCategory,
+  type DesktopNotificationSettings,
+  type DesktopNotificationSwitchKey,
+  type DesktopNotificationsBridge,
+} from '../types.ts'
+import css from './DesktopNotificationsRow.module.css'
+
+/** Optional carrier API supplied by the settings owner; absent on Web builds. */
+export interface DesktopNotificationsRowInjected {
+  bridge?: DesktopNotificationsBridge
+}
+
+/** Notification categories rendered as individual switches. */
+const CATEGORIES: readonly DesktopNotificationCategory[] = [
+  'approval', 'question', 'job', 'subagent', 'credential', 'remote', 'session', 'plugin', 'schedule', 'goal',
+]
+
+/** Default settings shared with the Desktop shell (apps/desktop/src/settings.ts). */
+const DEFAULT_SETTINGS: DesktopNotificationSettings = {
+  approval: true, question: true, job: true, subagent: false, credential: false, remote: false, session: false,
+  plugin: true, schedule: true, goal: true, focused: false, nonCurrentSession: true, trayFlash: true,
+  sticky: {
+    approval: false, question: false, job: false, subagent: false, credential: false,
+    remote: false, session: false, plugin: false, schedule: false, goal: false,
+  },
+}
+
+/** Focus-mode switch key: whether notifications also appear while focused. */
+const FOCUSED_KEY = 'focused' as const
+
+/** Non-current-session switch key: whether background sessions fire notifications. */
+const NON_CURRENT_SESSION_KEY = 'nonCurrentSession' as const
+
+/** Tray-flash switch key: whether the tray icon flashes on notification. */
+const TRAY_FLASH_KEY = 'trayFlash' as const
+
+/**
+ * Render the desktop notification category switches with a quick all-on/all-off
+ * control; categories that are off by default carry a flood warning. The
+ * focus-mode switch decides whether notifications also appear while the window
+ * has focus (default off = only while unfocused).
+ * @param props - accepted preferences, writer and localized copy.
+ * @returns the General Settings row, or nothing when the Desktop carrier is absent.
+ */
+export function DesktopNotificationsRow({ bridge, t }:
+  PropsRuntime<'settings.general.item'> & PropsLocale<'settings'> & InjectFace<DesktopNotificationsRowInjected>) {
+  const [settings, setSettings] = useState<DesktopNotificationSettings>(DEFAULT_SETTINGS)
+  const [busy, setBusy] = useState(false)
+  const [failed, setFailed] = useState(false)
+  // The persisted switches load asynchronously; once the user toggles one it
+  // must not be clobbered by the slower read that raced the write.
+  const edited = useBridgeValue(bridge, setSettings, () => { setFailed(true) })
+  if (bridge === undefined) return null
+  const setEnabled = (category: DesktopNotificationSwitchKey, enabled: boolean): void => {
+    edited.current = true
+    setFailed(false)
+    setBusy(true)
+    const previous = settings
+    // Sticky sub-keys arrive as `sticky:<category>`: update the nested
+    // sticky record rather than creating a bogus top-level key.
+    if (typeof category === 'string' && category.startsWith('sticky:')) {
+      const cat = category.slice(7) as DesktopNotificationCategory
+      setSettings({ ...settings, sticky: { ...settings.sticky, [cat]: enabled } })
+    } else {
+      setSettings({ ...settings, [category]: enabled })
+    }
+    void bridge.set(category, enabled).catch(() => {
+      setFailed(true)
+      setSettings(previous)
+    }).finally(() => { setBusy(false) })
+  }
+  const allOn = CATEGORIES.every(category => settings[category])
+  const applyAll = (): void => {
+    edited.current = true
+    setFailed(false)
+    setBusy(true)
+    const previous = settings
+    const target = !allOn
+    const toggled = Object.fromEntries(CATEGORIES.map(category => [category, target])) as Partial<DesktopNotificationSettings>
+    // When enabling all, also turn on every sticky switch so "全部开启" is
+    // truly all-on; when disabling all, clear sticky too since it has no
+    // effect when the notification itself is off.
+    const stickyNext = Object.fromEntries(CATEGORIES.map(category => [category, target])) as Record<DesktopNotificationCategory, boolean>
+    const next = { ...settings, ...toggled, sticky: stickyNext } as DesktopNotificationSettings
+    setSettings(next)
+    Promise.all([
+      ...CATEGORIES.map(category => bridge.set(category, target)),
+      ...CATEGORIES.map(category => bridge.set(`sticky:${category}` as DesktopNotificationSwitchKey, target)),
+    ]).catch(() => {
+      setFailed(true)
+      setSettings(previous)
+    }).finally(() => { setBusy(false) })
+  }
+  const restoreDefaults = (): void => {
+    edited.current = true
+    setFailed(false)
+    setBusy(true)
+    const previous = settings
+    setSettings(DEFAULT_SETTINGS)
+    void bridge.reset().then((value) => { if (!edited.current) return; setSettings(value) }).catch(() => {
+      setFailed(true)
+      setSettings(previous)
+    }).finally(() => { setBusy(false) })
+  }
+  return <div className={css.section}>
+    <div className={css.heading}>
+      <div className={css.titleRow}>
+        <div>
+          <div className={css.title}>{t('notifications.title')}</div>
+          <div className={css.description}>{t('notifications.description')}</div>
+        </div>
+        <div className={css.toggleGroup}>
+          <button type="button" className={css.allToggle} disabled={busy}
+            onClick={() => { void applyAll() }}>
+            {allOn ? t('notifications.allOff') : t('notifications.allOn')}
+          </button>
+          <button type="button" className={css.allToggle} disabled={busy}
+            onClick={() => { void restoreDefaults() }}>
+            {t('notifications.restoreDefaults')}
+          </button>
+        </div>
+      </div>
+      {failed && <div role="alert">{t('notifications.error')}</div>}
+    </div>
+    <div className={css.row} key={FOCUSED_KEY}>
+      <div className={css.labels}>
+        <div className={css.labelRow}>
+          <div className={css.label}>{t('notifications.focused')}</div>
+          <span className={css.help} title={t('notifications.focusedHint')}>?</span>
+        </div>
+        <div className={css.warning}>{t('notifications.focusedWarning')}</div>
+      </div>
+      <Switch checked={settings[FOCUSED_KEY]} disabled={busy} label={t('notifications.focused')}
+        onChange={(next) => { setEnabled(FOCUSED_KEY, next) }} />
+    </div>
+    <div className={css.row} key={NON_CURRENT_SESSION_KEY}>
+      <div className={css.labels}>
+        <div className={css.labelRow}>
+          <div className={css.label}>{t(`notifications.${NON_CURRENT_SESSION_KEY}`)}</div>
+          <span className={css.help} title={t(`notifications.${NON_CURRENT_SESSION_KEY}Hint`)}>?</span>
+        </div>
+      </div>
+      <Switch checked={settings[NON_CURRENT_SESSION_KEY]} disabled={busy} label={t(`notifications.${NON_CURRENT_SESSION_KEY}`)}
+        onChange={(next) => { setEnabled(NON_CURRENT_SESSION_KEY, next) }} />
+    </div>
+    <div className={css.row} key={TRAY_FLASH_KEY}>
+      <div className={css.labels}>
+        <div className={css.labelRow}>
+          <div className={css.label}>{t(`notifications.${TRAY_FLASH_KEY}`)}</div>
+          <span className={css.help} title={t(`notifications.${TRAY_FLASH_KEY}Hint`)}>?</span>
+        </div>
+      </div>
+      <Switch checked={settings[TRAY_FLASH_KEY]} disabled={busy} label={t(`notifications.${TRAY_FLASH_KEY}`)}
+        onChange={(next) => { setEnabled(TRAY_FLASH_KEY, next) }} />
+    </div>
+    <div className={css.categoryHeader}>
+      <div className={css.headerLeft}>{t('notifications.title')}</div>
+      <div className={css.headerSwitch}>{t('notifications.title')}</div>
+      <div className={css.headerRight}>{t('notifications.sticky')}</div>
+    </div>
+    {CATEGORIES.map(category => (
+      <div className={css.catRow} key={category}>
+        <div className={css.catLabels}>
+          <div className={css.labelRow}>
+            <div className={css.label}>{t(`notifications.${category}`)}</div>
+            <span className={css.help} title={t(`notifications.${category}Hint`)}>?</span>
+          </div>
+          {DESKTOP_NOTIFICATION_RECOMMENDED_DISABLED.includes(category) && (
+            <div className={css.warning}>{t('notifications.floodWarning')}</div>
+          )}
+        </div>
+        <div className={css.catSwitch}>
+          <Switch checked={settings[category]} disabled={busy} label={t(`notifications.${category}`)}
+            onChange={(next) => { setEnabled(category, next) }} />
+        </div>
+        <div className={css.catRight}>
+          <Switch
+            checked={settings.sticky[category] && settings[category]}
+            disabled={busy || !settings[category]}
+            label={t('notifications.sticky')}
+            onChange={(next) => { setEnabled(`sticky:${category}` as `sticky:${typeof category}`, next) }}
+          />
+        </div>
+      </div>
+    ))}
+  </div>
+}

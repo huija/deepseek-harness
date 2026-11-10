@@ -43,6 +43,7 @@ import type { PluginTab } from './tab-ledger.ts'
 import { shortName } from './presentation.ts'
 import { BundleDetailController, type BundleDetailsState } from './detail-store.ts'
 import type { LocaleSnapshot } from '@deepseek-ai/dsh-client-locale/client'
+import { notifyDesktop } from '@deepseek-ai/dsh-client-ui-primitives'
 
 /**
  * Read whether a bundle has a pending management action.
@@ -1459,7 +1460,29 @@ export class PluginManagerController {
   }
 
   private notifyHiddenInstall(outcome: Extract<ManagerNotice, { kind: 'install' }>['outcome']): void {
-    if (!this.getSnapshot().install.open) this.patch({ notice: { kind: 'install', outcome, seq: ++this.noticeSeq } })
+    if (!this.getSnapshot().install.open) {
+      this.patch({ notice: { kind: 'install', outcome, seq: ++this.noticeSeq } })
+      void this.desktopNotify(outcome)
+    }
+  }
+
+  /** Send a desktop notification for a completed or failed background install. */
+  private desktopNotify(outcome: Extract<ManagerNotice, { kind: 'install' }>['outcome']): void {
+    const subject = this.getSnapshot().install.subject
+    const name = subject?.name ?? subject?.spec ?? 'plugin'
+    if (outcome === 'done') {
+      notifyDesktop({
+        category: 'plugin',
+        title: { zh: '插件安装完成', en: 'Plugin installed' },
+        body: { zh: `${name} 已安装`, en: `${name} installed` },
+      })
+    } else if (outcome === 'failed' || outcome === 'unconfirmed' || outcome === 'unknown') {
+      notifyDesktop({
+        category: 'plugin',
+        title: { zh: '插件安装失败', en: 'Plugin installation failed' },
+        body: { zh: `${name} 安装失败`, en: `${name} installation failed` },
+      })
+    }
   }
 
   /**

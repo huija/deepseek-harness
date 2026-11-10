@@ -622,6 +622,31 @@ export class GoalService extends TypertRemoteService {
       ...goal === undefined ? {} : { goal },
     }
     agentEvents(this.ctx, agent).emit('goal/changed', { change: notification })
+    // Emit an unscoped event for desktop notifications when a goal is
+    // completed or blocked; the scoped goal/changed cannot cross the
+    // Remote event bridge.
+    if (change.operation === 'complete' || change.operation === 'block') {
+      if (change.operation === 'complete') {
+        this.ctx.emit('goal/completed-or-blocked', {
+          sessionId: agent.session.id,
+          operation: 'complete',
+        })
+      } else {
+        const objective = notification.goal?.objective ?? (change as { goal?: { objective?: string } }).goal?.objective
+        if (objective !== undefined) {
+          this.ctx.emit('goal/completed-or-blocked', {
+            sessionId: agent.session.id,
+            operation: 'block',
+            objective,
+          })
+        } else {
+          this.ctx.emit('goal/completed-or-blocked', {
+            sessionId: agent.session.id,
+            operation: 'block',
+          })
+        }
+      }
+    }
   }
 
   /** Build a detached current view. */

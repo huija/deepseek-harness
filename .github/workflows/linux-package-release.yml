@@ -1,0 +1,676 @@
+# 构建 DeepSeek Harness 桌面版 Linux x64 包（AppImage + deb）并发布 GitHub Release。
+# 支持两个分支：linux-custom-titlebar（定制优化版）与 linux-package-official（官方上游版）。
+# 文件名含分支标识以区分，发布说明中英双语。
+name: Linux x64 打包与发布 (AppImage + deb)
+
+on:
+  # 推送到以下任一分支时自动构建并发布。
+  push:
+    branches:
+      - linux-custom-titlebar
+      - linux-package-official
+    paths-ignore:
+      - 'README.md'
+      - 'README.zh.md'
+      - 'docs/**'
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: '构建分支：linux-custom-titlebar（定制版）/ linux-package-official（官方版）'
+        type: choice
+        options:
+          - linux-custom-titlebar
+          - linux-package-official
+        default: linux-custom-titlebar
+        required: true
+      publish:
+        description: '发布 GitHub Release 并上传制品'
+        type: boolean
+        default: true
+        required: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: linux-x64-package-${{ github.event.inputs.branch || github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  PRIMARY_NODE_VERSION: '24'
+  DSH_TELEMETRY_DISABLED: '1'
+  # workflow_dispatch 使用输入分支；push 事件使用被推送的分支名。
+  BUILD_BRANCH: ${{ github.event.inputs.branch || github.ref_name }}
+
+jobs:
+  package:
+    name: 构建 ${{ github.event.inputs.branch || github.ref_name }} · AppImage + deb
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ env.BUILD_BRANCH }}
+          fetch-depth: 0
+          persist-credentials: false
+          clean: true
+
+      - name: 识别分支类型与产品名称
+        id: branch
+        run: |
+          BRANCH="${BUILD_BRANCH}"
+          if [ "$BRANCH" = "linux-custom-titlebar" ]; then
+            echo "slug=custom" >> "$GITHUB_OUTPUT"
+            echo "name_suffix=定制优化版" >> "$GITHUB_OUTPUT"
+          else
+            echo "slug=official" >> "$GITHUB_OUTPUT"
+            echo "name_suffix=官方上游版" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: 配置缓存目录
+        run: |
+          echo "NODE_COMPILE_CACHE=${{ runner.temp }}/node-compile-cache" >> "$GITHUB_ENV"
+          echo "npm_config_devdir=${{ runner.temp }}/node-gyp" >> "$GITHUB_ENV"
+          echo "TMPDIR=${{ runner.temp }}" >> "$GITHUB_ENV"
+
+      - uses: pnpm/action-setup@v5.0.0
+        with:
+          dest: ${{ runner.temp }}/setup-pnpm-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - uses: actions/setup-node@v7.0.0
+        with:
+          node-version: ${{ env.PRIMARY_NODE_VERSION }}
+          package-manager-cache: false
+
+      - name: 配置 pnpm store
+        id: pnpm-store
+        run: |
+          store_root="$HOME/.local/share/pnpm/store"
+          echo "PNPM_CONFIG_STORE_DIR=$store_root" >> "$GITHUB_ENV"
+          store_path=$(PNPM_CONFIG_STORE_DIR="$store_root" pnpm store path --silent)
+          echo "path=$store_path" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/cache/restore@v6.1.0
+        with:
+          path: ${{ steps.pnpm-store.outputs.path }}
+          key: ${{ runner.os }}-node-${{ env.PRIMARY_NODE_VERSION }}-pnpm-${{ hashFiles('pnpm-lock.yaml') }}
+          restore-keys: |
+            ${{ runner.os }}-node-${{ env.PRIMARY_NODE_VERSION }}-pnpm-
+
+      - name: 安装依赖（不变更 lockfile）
+        run: pnpm install --frozen-lockfile
+
+      - name: 构建官方 workspace
+        run: pnpm run build:official
+
+      - name: 配置 Linux 更新源与发布说明
+        id: linux-update
+        if: env.BUILD_BRANCH == 'linux-package-official'
+        run: |
+          echo "DSH_DESKTOP_LINUX_UPDATE_URL=https://github.com/yaoyingkeji/deepseek-harness/releases/download/linux-latest-official/" >> "$GITHUB_ENV"
+          echo "DSH_DESKTOP_LINUX_RELEASE_NOTES=linux-package-official 分支构建 / Official upstream build" >> "$GITHUB_ENV"
+
+      - name: 打包 Linux AppImage + deb
+        run: bash package-linux.sh
+
+      - name: 确定版本号
+        id: version
+        run: |
+          V=$(node -p "require('./apps/desktop/package.json').version")
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+          echo "version=$V"
+
+      - name: 计算 SHA256SUMS
+        run: |
+          cd apps/desktop/.desktop-build/targets/linux-x64/artifacts
+          sha256sum *.AppImage *.deb > "SHA256SUMS.${{ steps.branch.outputs.slug }}-${{ steps.version.outputs.version }}"
+
+      - name: 上传构建制品
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: linux-x64-${{ steps.branch.outputs.slug }}-${{ steps.version.outputs.version }}
+          path: |
+            apps/desktop/.desktop-build/targets/linux-x64/artifacts/*.AppImage
+            apps/desktop/.desktop-build/targets/linux-x64/artifacts/*.deb
+            apps/desktop/.desktop-build/targets/linux-x64/artifacts/*.yml
+            apps/desktop/.desktop-build/targets/linux-x64/artifacts/SHA256SUMS.*
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: 发布 GitHub Release（${{ steps.branch.outputs.name_suffix }}）
+        if: github.event_name == 'push' || inputs.publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          VERSION="${{ steps.version.outputs.version }}"
+          SLUG="${{ steps.branch.outputs.slug }}"
+          SUFFIX_CN="${{ steps.branch.outputs.name_suffix }}"
+          ARTIFACTS="apps/desktop/.desktop-build/targets/linux-x64/artifacts"
+          TAG="v${VERSION}-linux-x64-${SLUG}"
+          BRANCH="${{ env.BUILD_BRANCH }}"
+
+          if [ "$BRANCH" = "linux-custom-titlebar" ]; then
+          NOTES=$(cat <<'NOTES_EOF'
+          ## 中文
+
+          本 Release 由 GitHub Actions 在 **ubuntu-24.04** 云端自动构建，源码来自 `linux-custom-titlebar` 分支。
+
+          ### 分支说明
+
+          基于 [deepseek-ai/deepseek-harness](https://github.com/deepseek-ai/deepseek-harness) 的 **Deepin v25 桌面端优化修改版**，适配并测试通过，其他 Linux 系统需自行测试。
+
+          > 仓库地址：[yaoyingkeji/deepseek-harness](https://github.com/yaoyingkeji/deepseek-harness)（分支 `linux-custom-titlebar`）
+
+          #### 定制功能
+
+          1. **自定义标题栏** —「应用 / 编辑」菜单内嵌进标题栏，与 Windows 版体验一致，节约屏幕高度
+          2. **去除原生菜单栏** — 抑制 GTK 菜单栏泄漏的调试项，界面更干净
+          3. **系统托盘** — 关闭后驻留托盘，托盘图标可快速「显示窗口 / 退出」；收到通知时托盘图标闪烁（可开关）
+          4. **关闭行为可配置** — 通用设置可选「隐藏到托盘（默认）」或「退出应用」
+          5. **桌面通知** — 以下 10 类场景弹出原生通知，每类可独立开关：
+             - 审核请求（工具授权时提醒）
+             - 模型提问（提问或评审计划时提醒）
+             - 后台任务（完成或失败时提醒）
+             - 子代理结束
+             - 凭证需要（需登录时提醒）
+             - 远程接入（外部连接请求时提醒）
+             - 新会话（含远程接入）
+             - 插件操作（安装完成或失败时提醒）
+             - 定时提醒（调度任务到期时提醒）
+             - Goal 状态（完成或阻塞时提醒）
+             另有「聚焦时不弹出」「非当前会话不弹出」「托盘图标闪烁」三个全局开关
+          6. **自动更新** — 应用内「检查更新」指向 `linux-latest` 自动更新源，AppImage 支持自动下载安装
+
+          #### 界面截图
+
+          | 欢迎界面 | 主界面（自定义标题栏） |
+          | :---: | :---: |
+          | ![欢迎界面](https://github.com/yaoyingkeji/deepseek-harness/raw/linux-custom-titlebar/docs/screenshots/linux-custom-titlebar/screenshot-01-welcome.png) | ![主界面](https://github.com/yaoyingkeji/deepseek-harness/raw/linux-custom-titlebar/docs/screenshots/linux-custom-titlebar/screenshot-02-main-window.png) |
+
+          | 「应用」菜单 | 菜单展开效果 |
+          | :---: | :---: |
+          | ![应用菜单](https://github.com/yaoyingkeji/deepseek-harness/raw/linux-custom-titlebar/docs/screenshots/linux-custom-titlebar/screenshot-03-app-menu.png) | ![菜单展开效果](https://github.com/yaoyingkeji/deepseek-harness/raw/linux-custom-titlebar/docs/screenshots/linux-custom-titlebar/screenshot-04-menu-open.png) |
+
+          | 桌面通知设置 | 托盘闪烁与桌面通知 |
+          | :---: | :---: |
+          | ![桌面通知设置](https://github.com/yaoyingkeji/deepseek-harness/raw/linux-custom-titlebar/docs/screenshots/linux-custom-titlebar/screenshot-05-settings.png) | ![托盘闪烁与桌面通知](https://github.com/yaoyingkeji/deepseek-harness/raw/linux-custom-titlebar/docs/screenshots/linux-custom-titlebar/screenshot-06-tray-flash.gif) |
+
+          #### 自动构建说明
+
+          本分支每次推送代码即自动触发云端构建（README / docs 变更除外），构建成功后同时执行：
+
+          - 发布版本化 Release（本页面）
+          - 刷新 `linux-latest` 自动更新源
+
+          ### 制品
+
+          | 制品 | 类型 | 说明 |
+          |------|------|------|
+          | `deepseek-harness-__VERSION__-linux-x64.AppImage` | AppImage | 免安装，添加执行权限即可运行 |
+          | `deepseek-harness___VERSION___amd64.deb` | deb | Debian / Ubuntu 系统安装包 |
+          | `SHA256SUMS.custom-__VERSION__` | 校验文件 | 下载后请核对哈希值，确保文件完整 |
+
+          ### 安装
+
+          ```bash
+          # AppImage
+          chmod +x deepseek-harness-__VERSION__-linux-x64.AppImage
+          ./deepseek-harness-__VERSION__-linux-x64.AppImage
+
+          # deb
+          sudo dpkg -i deepseek-harness___VERSION___amd64.deb
+          ```
+
+          ### 构建信息
+
+          - 版本号：__VERSION__
+          - 分支：`linux-custom-titlebar`（定制优化版）
+          - 构建触发：代码推送自动构建并发布
+          - 构建环境：GitHub Actions · ubuntu-24.04
+
+          ---
+
+          ## English
+
+          This release is built automatically by GitHub Actions on a **ubuntu-24.04** runner from the `linux-custom-titlebar` branch.
+
+          ### Branch Description
+
+          An **optimized fork** of [deepseek-ai/deepseek-harness](https://github.com/deepseek-ai/deepseek-harness) for the **Deepin v25 desktop**, tested and verified. Other Linux distributions require self-testing.
+
+          > Repository: [yaoyingkeji/deepseek-harness](https://github.com/yaoyingkeji/deepseek-harness) (branch `linux-custom-titlebar`)
+
+          #### Custom Features
+
+          1. **Custom title bar** — App and Edit menu embedded in the title bar, matching the Windows experience and saving screen real estate
+          2. **No native menu bar** — Suppresses leftover GTK menu bar leak from debug builds for a cleaner look
+          3. **System tray** — App stays in the tray after closing; tray icon offers quick "Show Window / Quit"; icon flashes on notification (toggleable)
+          4. **Configurable close behavior** — General settings toggle: "Hide to tray" (default) or "Quit application"
+          5. **Desktop notifications** — Native notifications for 10 event categories, each independently toggleable:
+             - Approval requests (tool authorization)
+             - Model questions (questions or plan reviews)
+             - Background jobs (finished or failed)
+             - Subagent finished
+             - Credentials needed (sign-in required)
+             - Remote access (external connection requests)
+             - New session (including remote sessions)
+             - Plugin operations (install finished or failed)
+             - Schedule reminders (scheduled task due)
+             - Goal status (completed or blocked)
+             Plus three global toggles: "Show while focused", "Non-current session", and "Tray icon flash"
+          6. **Auto-update** — In-app "Check for Updates" points to the `linux-latest` auto-update feed; AppImage auto-downloads and installs
+
+          #### Screenshots
+
+          | Welcome | Main Window (Custom Title Bar) |
+          | :---: | :---: |
+          | ![Welcome](https://github.com/yaoyingkeji/deepseek-harness/raw/linux-custom-titlebar/docs/screenshots/linux-custom-titlebar/screenshot-01-welcome.png) | ![Main Window](https://github.com/yaoyingkeji/deepseek-harness/raw/linux-custom-titlebar/docs/screenshots/linux-custom-titlebar/screenshot-02-main-window.png) |
+
+          | App Menu | Menu Expanded |
+          | :---: | :---: |
+          | ![App Menu](https://github.com/yaoyingkeji/deepseek-harness/raw/linux-custom-titlebar/docs/screenshots/linux-custom-titlebar/screenshot-03-app-menu.png) | ![Menu Expanded](https://github.com/yaoyingkeji/deepseek-harness/raw/linux-custom-titlebar/docs/screenshots/linux-custom-titlebar/screenshot-04-menu-open.png) |
+
+          | Notification Settings | Tray Flash & Desktop Notifications |
+          | :---: | :---: |
+          | ![Notification Settings](https://github.com/yaoyingkeji/deepseek-harness/raw/linux-custom-titlebar/docs/screenshots/linux-custom-titlebar/screenshot-05-settings.png) | ![Tray Flash & Desktop Notifications](https://github.com/yaoyingkeji/deepseek-harness/raw/linux-custom-titlebar/docs/screenshots/linux-custom-titlebar/screenshot-06-tray-flash.gif) |
+
+          #### Automatic Builds
+
+          Every push to this branch (except README / docs) triggers a cloud build, which upon success:
+
+          - Publishes a versioned Release (this page)
+          - Refreshes the `linux-latest` auto-update feed
+
+          ### Artifacts
+
+          | Artifact | Type | Description |
+          |----------|------|-------------|
+          | `deepseek-harness-__VERSION__-linux-x64.AppImage` | AppImage | Portable — make executable and run |
+          | `deepseek-harness___VERSION___amd64.deb` | deb | Debian / Ubuntu system package |
+          | `SHA256SUMS.custom-__VERSION__` | Checksums | Verify file integrity after download |
+
+          ### Installation
+
+          ```bash
+          # AppImage
+          chmod +x deepseek-harness-__VERSION__-linux-x64.AppImage
+          ./deepseek-harness-__VERSION__-linux-x64.AppImage
+
+          # deb
+          sudo dpkg -i deepseek-harness___VERSION___amd64.deb
+          ```
+
+          ### Build Info
+
+          - Version: __VERSION__
+          - Branch: `linux-custom-titlebar` (Custom Edition)
+          - Trigger: automatic on push
+          - Runner: GitHub Actions · ubuntu-24.04
+
+          ---
+
+          源码 / Source: https://github.com/deepseek-ai/deepseek-harness
+          Fork: https://github.com/yaoyingkeji/deepseek-harness
+          NOTES_EOF
+          )
+          NOTES="${NOTES//__VERSION__/$VERSION}"
+          else
+          NOTES=$(cat <<'NOTES_EOF'
+          ## 中文
+
+          本 Release 由 GitHub Actions 在 **ubuntu-24.04** 云端自动构建，源码来自 `linux-package-official` 分支。
+
+          ### 分支说明
+
+          基于 [deepseek-ai/deepseek-harness](https://github.com/deepseek-ai/deepseek-harness) 的**官方上游版**，功能与上游 `master` 完全一致。
+
+          > 仓库地址：[yaoyingkeji/deepseek-harness](https://github.com/yaoyingkeji/deepseek-harness)（分支 `linux-package-official`）
+
+          #### 与上游的区别
+
+          本分支**仅额外注入 Linux 打包基础设施**，不做任何 UI 或功能性修改：
+
+          - `linux-x64` 构建目标与 `electron-builder` 配置
+          - `package-linux.sh` 一键打包脚本
+          - 应用内「检查更新」指向 `linux-latest-official` 自动更新源
+
+          适合需要官方原版体验、且希望享受自动更新便利的用户。
+
+          #### 自动构建说明
+
+          本分支每次推送代码即自动触发云端构建（README / docs 变更除外），构建成功后同时执行：
+
+          - 发布版本化 Release（本页面）
+          - 刷新 `linux-latest-official` 自动更新源
+
+          ### 制品
+
+          | 制品 | 类型 | 说明 |
+          |------|------|------|
+          | `deepseek-harness-__VERSION__-linux-x64.AppImage` | AppImage | 免安装，添加执行权限即可运行 |
+          | `deepseek-harness___VERSION___amd64.deb` | deb | Debian / Ubuntu 系统安装包 |
+          | `SHA256SUMS.official-__VERSION__` | 校验文件 | 下载后请核对哈希值，确保文件完整 |
+
+          ### 安装
+
+          ```bash
+          # AppImage
+          chmod +x deepseek-harness-__VERSION__-linux-x64.AppImage
+          ./deepseek-harness-__VERSION__-linux-x64.AppImage
+
+          # deb
+          sudo dpkg -i deepseek-harness___VERSION___amd64.deb
+          ```
+
+          ### 构建信息
+
+          - 版本号：__VERSION__
+          - 分支：`linux-package-official`（官方上游版）
+          - 构建触发：代码推送自动构建并发布
+          - 构建环境：GitHub Actions · ubuntu-24.04
+
+          ---
+
+          ## English
+
+          This release is built automatically by GitHub Actions on a **ubuntu-24.04** runner from the `linux-package-official` branch.
+
+          ### Branch Description
+
+          An **official upstream build** of [deepseek-ai/deepseek-harness](https://github.com/deepseek-ai/deepseek-harness), functionally identical to upstream `master`.
+
+          > Repository: [yaoyingkeji/deepseek-harness](https://github.com/yaoyingkeji/deepseek-harness) (branch `linux-package-official`)
+
+          #### Differences from Upstream
+
+          This branch **only adds Linux packaging infrastructure** — no UI or functional changes:
+
+          - `linux-x64` build target and `electron-builder` configuration
+          - `package-linux.sh` one-shot packaging script
+          - In-app "Check for Updates" points to the `linux-latest-official` auto-update feed
+
+          Ideal for users who want the authentic upstream experience with the convenience of auto-update.
+
+          #### Automatic Builds
+
+          Every push to this branch (except README / docs) triggers a cloud build, which upon success:
+
+          - Publishes a versioned Release (this page)
+          - Refreshes the `linux-latest-official` auto-update feed
+
+          ### Artifacts
+
+          | Artifact | Type | Description |
+          |----------|------|-------------|
+          | `deepseek-harness-__VERSION__-linux-x64.AppImage` | AppImage | Portable — make executable and run |
+          | `deepseek-harness___VERSION___amd64.deb` | deb | Debian / Ubuntu system package |
+          | `SHA256SUMS.official-__VERSION__` | Checksums | Verify file integrity after download |
+
+          ### Installation
+
+          ```bash
+          # AppImage
+          chmod +x deepseek-harness-__VERSION__-linux-x64.AppImage
+          ./deepseek-harness-__VERSION__-linux-x64.AppImage
+
+          # deb
+          sudo dpkg -i deepseek-harness___VERSION___amd64.deb
+          ```
+
+          ### Build Info
+
+          - Version: __VERSION__
+          - Branch: `linux-package-official` (Official Upstream Edition)
+          - Trigger: automatic on push
+          - Runner: GitHub Actions · ubuntu-24.04
+
+          ---
+
+          源码 / Source: https://github.com/deepseek-ai/deepseek-harness
+          Fork: https://github.com/yaoyingkeji/deepseek-harness
+          NOTES_EOF
+          )
+          NOTES="${NOTES//__VERSION__/$VERSION}"
+          fi
+
+          gh release delete "$TAG" --yes --cleanup-tag 2>/dev/null || true
+          gh release create "$TAG" \
+            "$ARTIFACTS"/*.AppImage \
+            "$ARTIFACTS"/*.deb \
+            "$ARTIFACTS"/SHA256SUMS.* \
+            "$ARTIFACTS"/*.yml \
+            --repo "${{ github.repository }}" \
+            --target "$GITHUB_SHA" \
+            --title "DeepSeek Harness ${VERSION} (Linux x64 · ${SUFFIX_CN})" \
+            --notes "$NOTES" \
+            --prerelease
+
+      - name: 刷新 linux-latest 自动更新源（仅定制版）
+        if: (github.event_name == 'push' || inputs.publish) && env.BUILD_BRANCH == 'linux-custom-titlebar'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          VERSION="${{ steps.version.outputs.version }}"
+          ARTIFACTS="apps/desktop/.desktop-build/targets/linux-x64/artifacts"
+          LATEST_TAG="linux-latest"
+          LATEST_NOTES=$(cat <<'LATEST_EOF'
+          ## 中文
+
+          ### 分支说明
+
+          基于 [deepseek-ai/deepseek-harness](https://github.com/deepseek-ai/deepseek-harness) 的 **Deepin v25 桌面端优化修改版**，适配并测试通过，其他 Linux 系统需自行测试。
+
+          > 仓库地址：[yaoyingkeji/deepseek-harness](https://github.com/yaoyingkeji/deepseek-harness)（分支 `linux-custom-titlebar`）
+
+          1. **自定义标题栏** —「应用 / 编辑」菜单内嵌进标题栏，与 Windows 版体验一致，节约屏幕高度
+          2. **去除原生菜单栏** — 抑制 GTK 菜单栏泄漏的调试项，界面更干净
+          3. **系统托盘** — 关闭后驻留托盘，托盘图标可快速「显示窗口 / 退出」；收到通知时图标闪烁（可开关）
+          4. **关闭行为可配置** — 通用设置可选「隐藏到托盘（默认）」或「退出应用」
+          5. **桌面通知** — 以下 10 类场景弹出原生通知，每类可独立开关，另有三项全局开关：
+             · 审核请求 · 模型提问 · 后台任务 · 子代理结束 · 凭证需要
+             · 远程接入 · 新会话 · 插件操作 · 定时提醒 · Goal 状态
+          6. **自动更新** — 应用内「检查更新」指向此 `linux-latest` 自动更新源，AppImage 支持自动下载安装
+
+          ### 界面截图
+
+          | 欢迎界面 | 主界面（自定义标题栏） |
+          | :---: | :---: |
+          | ![欢迎界面](https://github.com/yaoyingkeji/deepseek-harness/raw/linux-custom-titlebar/docs/screenshots/linux-custom-titlebar/screenshot-01-welcome.png) | ![主界面](https://github.com/yaoyingkeji/deepseek-harness/raw/linux-custom-titlebar/docs/screenshots/linux-custom-titlebar/screenshot-02-main-window.png) |
+
+          | 「应用」菜单 | 菜单展开效果 |
+          | :---: | :---: |
+          | ![应用菜单](https://github.com/yaoyingkeji/deepseek-harness/raw/linux-custom-titlebar/docs/screenshots/linux-custom-titlebar/screenshot-03-app-menu.png) | ![菜单展开效果](https://github.com/yaoyingkeji/deepseek-harness/raw/linux-custom-titlebar/docs/screenshots/linux-custom-titlebar/screenshot-04-menu-open.png) |
+
+          | 桌面通知设置 | 托盘闪烁与桌面通知 |
+          | :---: | :---: |
+          | ![桌面通知设置](https://github.com/yaoyingkeji/deepseek-harness/raw/linux-custom-titlebar/docs/screenshots/linux-custom-titlebar/screenshot-05-settings.png) | ![托盘闪烁与桌面通知](https://github.com/yaoyingkeji/deepseek-harness/raw/linux-custom-titlebar/docs/screenshots/linux-custom-titlebar/screenshot-06-tray-flash.gif) |
+
+          ### 自动更新源
+
+          此 Release 是 DeepSeek Harness Linux x64 **定制优化版** 的自动更新源。每次云端构建成功后，GitHub Actions 自动刷新此 Release 至最新版本。应用内「检查更新」即读取此页面的制品元数据判断是否有新版本。
+
+          | 属性 | 值 |
+          |------|-----|
+          | 当前版本 | __VERSION__ |
+          | 来源分支 | `linux-custom-titlebar` |
+          | 构建环境 | GitHub Actions · ubuntu-24.04 |
+          | 更新方式 | 应用内「通用设置 → 检查更新」，AppImage 自动下载安装 |
+
+          版本化独立构建见：[`v__VERSION__-linux-x64-custom`](https://github.com/yaoyingkeji/deepseek-harness/releases/tag/v__VERSION__-linux-x64-custom)
+
+          仓库浏览与下载：[Releases 页面](https://github.com/yaoyingkeji/deepseek-harness/releases)
+
+          ---
+
+          ## English
+
+          ### Branch Description
+
+          An **optimized fork** of [deepseek-ai/deepseek-harness](https://github.com/deepseek-ai/deepseek-harness) for the **Deepin v25 desktop**, tested and verified. Other Linux distributions require self-testing.
+
+          > Repository: [yaoyingkeji/deepseek-harness](https://github.com/yaoyingkeji/deepseek-harness) (branch `linux-custom-titlebar`)
+
+          1. **Custom title bar** — App and Edit menu embedded in the title bar, matching the Windows experience and saving screen real estate
+          2. **No native menu bar** — Suppresses leftover GTK menu bar leak from debug builds for a cleaner look
+          3. **System tray** — App stays in the tray after closing; tray icon offers quick "Show Window / Quit"; icon flashes on notification (toggleable)
+          4. **Configurable close behavior** — General settings toggle: "Hide to tray" (default) or "Quit application"
+          5. **Desktop notifications** — 10 event categories, each independently toggleable, plus three global toggles:
+             · Approval requests · Model questions · Background jobs · Subagent finished · Credentials needed
+             · Remote access · New session · Plugin operations · Schedule reminders · Goal status
+          6. **Auto-update** — In-app "Check for Updates" points to this `linux-latest` auto-update feed; AppImage auto-downloads and installs
+
+          ### Screenshots
+
+          | Welcome | Main Window (Custom Title Bar) |
+          | :---: | :---: |
+          | ![Welcome](https://github.com/yaoyingkeji/deepseek-harness/raw/linux-custom-titlebar/docs/screenshots/linux-custom-titlebar/screenshot-01-welcome.png) | ![Main Window](https://github.com/yaoyingkeji/deepseek-harness/raw/linux-custom-titlebar/docs/screenshots/linux-custom-titlebar/screenshot-02-main-window.png) |
+
+          | App Menu | Menu Expanded |
+          | :---: | :---: |
+          | ![App Menu](https://github.com/yaoyingkeji/deepseek-harness/raw/linux-custom-titlebar/docs/screenshots/linux-custom-titlebar/screenshot-03-app-menu.png) | ![Menu Expanded](https://github.com/yaoyingkeji/deepseek-harness/raw/linux-custom-titlebar/docs/screenshots/linux-custom-titlebar/screenshot-04-menu-open.png) |
+
+          | Notification Settings | Tray Flash & Desktop Notifications |
+          | :---: | :---: |
+          | ![Notification Settings](https://github.com/yaoyingkeji/deepseek-harness/raw/linux-custom-titlebar/docs/screenshots/linux-custom-titlebar/screenshot-05-settings.png) | ![Tray Flash & Desktop Notifications](https://github.com/yaoyingkeji/deepseek-harness/raw/linux-custom-titlebar/docs/screenshots/linux-custom-titlebar/screenshot-06-tray-flash.gif) |
+
+          ### Auto-Update Feed
+
+          This release is the **auto-update feed** for DeepSeek Harness Linux x64 Custom Edition. After every successful cloud build, GitHub Actions automatically refreshes this release to the latest version. The in-app "Check for Updates" reads artifact metadata from this page to detect new versions.
+
+          | Property | Value |
+          |----------|-------|
+          | Current Version | __VERSION__ |
+          | Source Branch | `linux-custom-titlebar` |
+          | Runner | GitHub Actions · ubuntu-24.04 |
+          | Update Method | In-app "General Settings → Check for Updates"; AppImage auto-downloads and installs |
+
+          Versioned build: [`v__VERSION__-linux-x64-custom`](https://github.com/yaoyingkeji/deepseek-harness/releases/tag/v__VERSION__-linux-x64-custom)
+
+          Browse & download: [Releases page](https://github.com/yaoyingkeji/deepseek-harness/releases)
+
+          ---
+
+          源码 / Source: https://github.com/deepseek-ai/deepseek-harness
+          Fork: https://github.com/yaoyingkeji/deepseek-harness
+          LATEST_EOF
+          )
+          LATEST_NOTES="${LATEST_NOTES//__VERSION__/$VERSION}"
+          gh release delete "$LATEST_TAG" --yes --cleanup-tag 2>/dev/null || true
+          gh release create "$LATEST_TAG" \
+            "$ARTIFACTS"/*.AppImage \
+            "$ARTIFACTS"/*.deb \
+            "$ARTIFACTS"/SHA256SUMS.* \
+            "$ARTIFACTS"/*.yml \
+            --repo "${{ github.repository }}" \
+            --target "$GITHUB_SHA" \
+            --title "DeepSeek Harness ${VERSION} (Linux x64 · latest)" \
+            --notes "$LATEST_NOTES" \
+            --prerelease
+
+      - name: 刷新 linux-latest-official 自动更新源（官方构建版）
+        if: (github.event_name == 'push' || inputs.publish) && env.BUILD_BRANCH == 'linux-package-official'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          VERSION="${{ steps.version.outputs.version }}"
+          ARTIFACTS="apps/desktop/.desktop-build/targets/linux-x64/artifacts"
+          LATEST_TAG="linux-latest-official"
+          LATEST_NOTES=$(cat <<'LATEST_EOF'
+          ## 中文
+
+          ### 分支说明
+
+          基于 [deepseek-ai/deepseek-harness](https://github.com/deepseek-ai/deepseek-harness) 的**官方上游版**，功能与上游 `master` 完全一致。
+
+          > 仓库地址：[yaoyingkeji/deepseek-harness](https://github.com/yaoyingkeji/deepseek-harness)（分支 `linux-package-official`）
+
+          本分支**仅额外注入 Linux 打包基础设施**，不做任何 UI 或功能性修改：
+
+          - `linux-x64` 构建目标与 `electron-builder` 配置
+          - `package-linux.sh` 一键打包脚本
+          - 应用内「检查更新」指向此 `linux-latest-official` 自动更新源
+
+          适合需要官方原版体验、且希望享受自动更新便利的用户。
+
+          ### 自动更新源
+
+          此 Release 是 DeepSeek Harness Linux x64 **官方上游版** 的自动更新源。每次云端构建成功后，GitHub Actions 自动刷新此 Release 至最新版本。应用内「检查更新」即读取此页面的制品元数据判断是否有新版本。
+
+          | 属性 | 值 |
+          |------|-----|
+          | 当前版本 | __VERSION__ |
+          | 来源分支 | `linux-package-official` |
+          | 构建环境 | GitHub Actions · ubuntu-24.04 |
+          | 更新方式 | 应用内「通用设置 → 检查更新」，AppImage 自动下载安装 |
+
+          版本化独立构建见：[`v__VERSION__-linux-x64-official`](https://github.com/yaoyingkeji/deepseek-harness/releases/tag/v__VERSION__-linux-x64-official)
+
+          仓库浏览与下载：[Releases 页面](https://github.com/yaoyingkeji/deepseek-harness/releases)
+
+          ---
+
+          ## English
+
+          ### Branch Description
+
+          An **official upstream build** of [deepseek-ai/deepseek-harness](https://github.com/deepseek-ai/deepseek-harness), functionally identical to upstream `master`.
+
+          > Repository: [yaoyingkeji/deepseek-harness](https://github.com/yaoyingkeji/deepseek-harness) (branch `linux-package-official`)
+
+          This branch **only adds Linux packaging infrastructure** — no UI or functional changes:
+
+          - `linux-x64` build target and `electron-builder` configuration
+          - `package-linux.sh` one-shot packaging script
+          - In-app "Check for Updates" points to this `linux-latest-official` auto-update feed
+
+          Ideal for users who want the authentic upstream experience with the convenience of auto-update.
+
+          ### Auto-Update Feed
+
+          This release is the **auto-update feed** for DeepSeek Harness Linux x64 Official Edition. After every successful cloud build, GitHub Actions automatically refreshes this release to the latest version. The in-app "Check for Updates" reads artifact metadata from this page to detect new versions.
+
+          | Property | Value |
+          |----------|-------|
+          | Current Version | __VERSION__ |
+          | Source Branch | `linux-package-official` |
+          | Runner | GitHub Actions · ubuntu-24.04 |
+          | Update Method | In-app "General Settings → Check for Updates"; AppImage auto-downloads and installs |
+
+          Versioned build: [`v__VERSION__-linux-x64-official`](https://github.com/yaoyingkeji/deepseek-harness/releases/tag/v__VERSION__-linux-x64-official)
+
+          Browse & download: [Releases page](https://github.com/yaoyingkeji/deepseek-harness/releases)
+
+          ---
+
+          源码 / Source: https://github.com/deepseek-ai/deepseek-harness
+          Fork: https://github.com/yaoyingkeji/deepseek-harness
+          LATEST_EOF
+          )
+          LATEST_NOTES="${LATEST_NOTES//__VERSION__/$VERSION}"
+          gh release delete "$LATEST_TAG" --yes --cleanup-tag 2>/dev/null || true
+          gh release create "$LATEST_TAG" \
+            "$ARTIFACTS"/*.AppImage \
+            "$ARTIFACTS"/*.deb \
+            "$ARTIFACTS"/SHA256SUMS.* \
+            "$ARTIFACTS"/*.yml \
+            --repo "${{ github.repository }}" \
+            --target "$GITHUB_SHA" \
+            --title "DeepSeek Harness ${VERSION} (Linux x64 · latest-official)" \
+            --notes "$LATEST_NOTES" \
+            --prerelease
+
+      - name: 同步 README 状态表
+        if: github.event_name == 'push' || inputs.publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          BRANCH="${BUILD_BRANCH}"
+          VERSION="${{ steps.version.outputs.version }}"
+          # checkout 使用 persist-credentials: false，这里为状态提交单独配置凭据
+          git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git"
+          # 交给 Node 脚本处理 README 状态段，避免 sed 处理多语言表格出错
+          node .github/scripts/sync-readme-status.mjs "$BRANCH" "$VERSION" "${{ steps.branch.outputs.slug }}"

@@ -43,6 +43,9 @@ export { RpcId, transportError } from './rpc.ts'
 export { Peer } from './peer.ts'
 export type { PeerOptions } from './peer.ts'
 export { CONNECT_PATH, type ConnectionInteractions } from './connect-protocol.ts'
+// Loads the `connection/remote-requested` event declaration into this face.
+import './remote-connection-request.ts'
+export type { RemoteConnectionRequest } from './remote-connection-request.ts'
 export {
   clientRequestSchema,
   rpcErrorSchema,

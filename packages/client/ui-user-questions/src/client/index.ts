@@ -31,6 +31,7 @@ import { QuestionComposer } from './QuestionComposer.tsx'
 import { answeredQuestionDefinition, questionReplyDefinition } from './question-reply.ts'
 import { QuestionReplyView } from './QuestionReplyView.tsx'
 import { en, ja, es, fr, de, ru, pt, zh, type QuestionKey } from './locales.ts'
+import { notifyDesktop } from '@deepseek-ai/dsh-client-ui-primitives'
 
 export type {
   PendingQuestion, PlanReview, QuestionAnswer, QuestionComposerProps, QuestionWait,
@@ -116,6 +117,21 @@ class QuestionCards {
 
   /** Publish one carrier into the composer seat and register the card that owns it. */
   #create(pending: PendingQuestion): QuestionCard {
+    // A new question card is the reliable signal that the model is waiting for
+    // an answer (covers both live events and restored projections), so it is
+    // also the desktop-notification trigger; the composer covers focused use.
+    const review = pending.kind === 'plan-review'
+    const first = pending.questions[0]
+    const zhBody = review ? '需要您评审计划'
+      : (first === undefined ? '请打开 DeepSeek Harness 查看问题' : first.question)
+    const enBody = review ? 'A plan needs your review'
+      : (first === undefined ? 'Open DeepSeek Harness to answer' : first.question)
+    notifyDesktop({
+      category: 'question',
+      title: { zh: '模型需要向您提问', en: 'Question from the model' },
+      body: { zh: zhBody, en: enBody },
+      sessionId: pending.sessionId,
+    })
     const requests = new Set<Promise<void>>()
     const delegate = async (): Promise<void> => {
       pending.delegate()

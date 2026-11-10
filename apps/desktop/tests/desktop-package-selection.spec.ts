@@ -132,9 +132,13 @@ it('routes both Mac architectures to one machine without authorizing an unlisted
       .toMatchObject({ runnerName: 'mini', runnerLabel: 'dsh-mini' })
   }
   expect(() => selectDesktopPackage('owner/repo', { package_run_id: '42' }, f.routes, f.api)).toThrow(/no configured/u)
-  for (const target of [[], ['mac-x64', 'linux-x64']]) {
+  // An empty list and a list that never covers the run's own target are both refused;
+  // a valid list that covers the run (now including linux-x64 alongside mac targets) is accepted.
+  for (const target of [[], ['linux-x64']]) {
     expect(() => selectDesktopPackage('owner/repo', { package_run_id: '42' }, { mini: { label: 'dsh-mini', target } }, f.api)).toThrow()
   }
+  expect(selectDesktopPackage('owner/repo', { package_run_id: '42' }, { mini: { label: 'dsh-mini', target: ['mac-x64', 'linux-x64'] } }, f.api))
+    .toMatchObject({ runnerName: 'mini', runnerLabel: 'dsh-mini' })
 })
 
 it.each([false, true])('keeps original build after archival retry with reused job listed: %s', (includesReused) => {

@@ -87,7 +87,7 @@ Windows 在整个运行期间常驻托盘图标。悬停提示为产品名，单
 
 ## 关键技术决策
 
-设计师原稿位于 `resources/icon.png` 和 `resources/icon.svg`；平台适配保留鲸鱼与渐变，分别位于 `resources/icon-windows.*` 和 `resources/icon-macos.*`。将各平台 SVG 导出为透明的 1024×1024 PNG。electron-builder 为 Windows 应用、安装程序和卸载程序生成多尺寸 ICO（[Windows 图标要求](https://learn.microsoft.com/en-us/windows/apps/design/iconography/app-icon-construction)）。安装页面在两种主题下使用匹配的图案；卸载程序的欢迎和完成页共用 `installer/assets/uninstaller-sidebar.png`，准备阶段将其转换为 164×314 BMP。
+设计师原稿位于 `resources/icon.png` 和 `resources/icon.svg`；平台适配保留鲸鱼与渐变，分别位于 `resources/icon-windows.*` 和 `resources/icon-macos.*`。将各平台 SVG 导出为透明的 1024×1024 PNG。electron-builder 为 Windows 应用、安装程序和卸载程序生成多尺寸 ICO（[Windows 图标要求](https://learn.microsoft.com/en-us/windows/apps/design/iconography/app-icon-construction)）。安装页面在两种主题下使用匹配的图案；卸载程序的欢迎和完成页共用 `installer/assets/uninstaller-sidebar.png`，准备阶段将其转换为 164×314 BMP。Linux 的启动器图标为 `resources/icons/` 下每个标准 hicolor 尺寸各一张位图，由 `pnpm run render:linux-icons` 从 Linux 专用的 `resources/icon-linux.svg` 渲染；electron-builder 将每个文件复制到对应的 `hicolor/<边长>x<边长>/apps/` 目录，缺少任一尺寸都会让桌面环境回退显示默认齿轮图标。`resources/icon-linux.svg` 是 `resources/icon.svg` 的 Linux 专用变体：圆角白底铺满整个图标位置，替代内缩在透明边距中的近白方块，鲸鱼以全不透明度纯黑绘制，而非 90% 不透明度叠在该方块上；共用的 `icon.svg` 保持原样，因为网页安装图标由它渲染。窗口、任务栏和通知图标共用同一原稿渲染的 `resources/icon-tile.png`，保证深色面板上也清晰可辨；只有托盘在 `resources/icon-dark.png`（浅色主题）与 `resources/icon-light.png`（深色主题）之间随系统主题切换。
 
 快捷键覆盖保存在 `app.getPath('userData')/keybindings.json`，与 `DSH_HOME` 分离。主进程校验并串行保存修改后才发布已接受键位。读取失败保留上次接受的键位并阻止编辑，包括全部恢复；不可读和未来版本的文件保持不变。开发时可通过 `DSH_DESKTOP_USER_DATA_DIR` 隔离这些偏好，启动器会输出解析后的路径。格式和冲突语义见[快捷键服务](../../packages/client/shortcuts/README.zh.md)。
 

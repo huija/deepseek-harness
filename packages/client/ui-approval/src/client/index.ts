@@ -8,6 +8,7 @@ import type { PendingInteractionPublisher } from '@deepseek-ai/dsh-client-ui-ses
 import type { TypertClientEventListener } from '@deepseek-ai/dsh-typert-protocol'
 import type {} from '@deepseek-ai/dsh-client-locale/client'
 import type { ShortcutCommandId } from '@deepseek-ai/dsh-client-shortcuts/client'
+import { notifyDesktop } from '@deepseek-ai/dsh-client-ui-primitives'
 import { ApprovalCard } from './ApprovalCard.tsx'
 import { ApprovalPanel } from './ApprovalPanel.tsx'
 import { PendingApproval } from './contract/slots.ts'
@@ -105,6 +106,13 @@ export function apply(ctx: ClientContext): void {
     }),
   }, ApprovalPanel))
   ctx.remote.$on('approval/request', function (request, next) {
+    // Background approvals need a desktop notification; the panel covers focused use.
+    notifyDesktop({
+      category: 'approval',
+      title: { zh: '需要审核权限', en: 'Approval required' },
+      body: { zh: `${request.toolName} 需要您授权`, en: `${request.toolName} requires your approval` },
+      sessionId: ctx.sessions.scopeOf(this),
+    })
     return answerApproval(ctx, this, request, next, registerPendingInteraction)
   })
 }

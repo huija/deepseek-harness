@@ -46,6 +46,19 @@ export interface DesktopElectronBuilderConfig {
       readonly signingHashAlgorithms: readonly string[]
     }
   }
+  readonly linux: {
+    readonly icon: string
+    readonly category: string
+    readonly maintainer: string
+    readonly synopsis: string
+    readonly executableName: string
+    readonly desktop: {
+      readonly entry: {
+        readonly StartupWMClass: string
+      }
+    }
+    readonly target: readonly string[]
+  }
   readonly nsis: {
     readonly uninstallDisplayName: '${productName}'
     readonly include: string

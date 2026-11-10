@@ -6,6 +6,7 @@
  */
 import type { Context as ClientContext } from '@deepseek-ai/cordis'
 import type { JobId } from '@deepseek-ai/dsh-jobs/brand'
+import type { JobStatus } from '@deepseek-ai/dsh-jobs/view'
 import { JobListAction } from './JobListAction.tsx'
 import type { JobListInjected } from './JobListAction.tsx'
 import type {} from '@deepseek-ai/dsh-api-job-controller/client'
@@ -13,6 +14,7 @@ import type {} from '@deepseek-ai/dsh-client-locale/client'
 import type {} from '@deepseek-ai/dsh-client-ui-renderer/client'
 import type {} from '@deepseek-ai/dsh-client-ui-session/client'
 import { en, ja, es, fr, de, ru, pt, NS, zh, type JobKey } from './locales.ts'
+import { notifyDesktop } from '@deepseek-ai/dsh-client-ui-primitives'
 
 declare module '@deepseek-ai/dsh-client-ui-slots' {
   interface LocaleNamespaceMap {
@@ -32,6 +34,41 @@ export const inject = ['jobs', 'slots', 'locale']
  */
 export function apply(ctx: ClientContext): void {
   ctx.effect(() => ctx.locale.register(NS, { zh, en, ja, es, fr, de, ru, pt }), 'ui-jobs: dictionaries')
+  // Desktop notifications when background jobs settle while the window is
+  // not focused; the job list already covers focused use.
+  const settled: Record<string, JobStatus> = {}
+  const notifyOnSettle = (): void => {
+    const snapshot = ctx.jobs.state.getSnapshot()
+    const current = new Set<string>()
+    for (const jobs of Object.values(snapshot.rows)) {
+      for (const job of jobs) {
+        current.add(job.id)
+        const previous = settled[job.id]
+        if ((previous === 'running' || previous === 'stopping')
+          && (job.status === 'completed' || job.status === 'failed')) {
+          const finished = job.status === 'completed'
+          notifyDesktop({
+            category: 'job',
+            title: {
+              zh: finished ? '任务完成' : '任务失败',
+              en: finished ? 'Task finished' : 'Task failed',
+            },
+            body: {
+              zh: `${job.label} ${finished ? '已完成' : '已失败'}`,
+              en: `${job.label} ${finished ? 'finished' : 'failed'}`,
+            },
+            sessionId: job.owner,
+          })
+        }
+        settled[job.id] = job.status
+      }
+    }
+    for (const id of Object.keys(settled)) {
+      // oxlint-disable-next-line typescript/no-dynamic-delete -- the key set is fully local to this tracker
+      if (!current.has(id)) delete settled[id]
+    }
+  }
+  ctx.effect(() => ctx.jobs.state.subscribe(notifyOnSettle), 'ui-jobs: desktop notification subscription')
   ctx.slots.inject(
     'conversation.session.header.actions',
     () => ctx.slots.register({

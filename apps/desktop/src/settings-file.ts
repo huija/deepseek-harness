@@ -66,11 +66,13 @@ export function isDesktopUpdateChannel(value: unknown): value is DesktopUpdatePr
 }
 
 /**
- * Resolve the document shared by shell preferences and update channels.
+ * Resolve the document shared by shell preferences and update channels. The
+ * same file also carries the shell's window and notification preferences
+ * (settings.ts); every writer therefore replaces only the fields it owns.
  * @param userData - Electron userData, independent of Host and DSH_HOME.
  * @returns Settings file path without filesystem changes.
  */
-function desktopSettingsPath(userData: string): string {
+export function desktopSettingsPath(userData: string): string {
   return join(userData, 'desktop', 'settings.json')
 }
 

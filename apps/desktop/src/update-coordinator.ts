@@ -14,6 +14,75 @@ import { discardDesktopUpdate } from './updates/electron-updater/discard.ts'
 
 const { autoUpdater } = electronUpdater
 
+/**
+ * The update feed answered with a version semver cannot read. A malformed feed
+ * is a packaging fault rather than an unreachable one, so the dual-level check
+ * keeps it loud instead of falling back to upstream.
+ */
+class DesktopFeedVersionError extends Error {
+  constructor() {
+    super('desktop update: feed version is invalid')
+    this.name = 'DesktopFeedVersionError'
+  }
+}
+
+/** Upstream repo for fallback version checks when the branch feed has no newer build. */
+const UPSTREAM_REPO = 'deepseek-ai/deepseek-harness'
+const FALLBACK_HTTP_TIMEOUT_MS = 15_000
+
+/**
+ * Whether the packaged application has an update source. On Linux the generic
+ * provider writes app-update.yml (and publishes latest-linux.yml to the feed
+ * URL); on Windows and macOS the provider writes app-update.yml.
+ */
+function updateSourceExists(): boolean {
+  if (!app.isPackaged) return false
+  return existsSync(join(process.resourcesPath, 'app-update.yml'))
+    || existsSync(join(process.resourcesPath, 'latest-linux.yml'))
+}
+
+/**
+ * Extract markdown release notes from an updater check result. Generic feeds
+ * carry the notes as a plain markdown string in the update metadata.
+ * @param updateInfo - Checked update metadata.
+ * @returns Markdown notes, or undefined when the feed carries none.
+ */
+export function desktopUpdateReleaseNotes(updateInfo: UpdateInfo): string | undefined {
+  const notes = updateInfo.releaseNotes
+  if (typeof notes !== 'string') return undefined
+  const trimmed = notes.trim()
+  return trimmed === '' ? undefined : trimmed
+}
+
+/**
+ * Query the upstream GitHub repository for its latest release tag version.
+ * Returns the tag name without the leading "dsh-" prefix when it's a dsh-*
+ * tag, otherwise returns the full tag name.
+ * @returns Latest upstream version string, or undefined on any error.
+ */
+async function fetchUpstreamLatestVersion(): Promise<string | undefined> {
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), FALLBACK_HTTP_TIMEOUT_MS)
+  try {
+    const response = await fetch(
+      `https://api.github.com/repos/${UPSTREAM_REPO}/releases/latest`,
+      {
+        headers: { Accept: 'application/vnd.github+json', 'X-GitHub-Api-Version': '2022-11-28' },
+        signal: controller.signal,
+      },
+    )
+    if (!response.ok) return undefined
+    const release = await response.json() as { tag_name?: string }
+    if (typeof release.tag_name !== 'string') return undefined
+    // Strip "dsh-v" prefix to get the semver: dsh-v0.2.3-alpha.1 → 0.2.3-alpha.1
+    return release.tag_name.startsWith('dsh-') ? release.tag_name.slice(4) : release.tag_name
+  } catch {
+    return undefined
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
 /** Owns one updater target until its download and installation settle. */
 export class DesktopUpdateCoordinator {
   private current: DesktopUpdateState = { phase: 'idle' }
@@ -41,7 +110,6 @@ export class DesktopUpdateCoordinator {
   }
 
   private readonly onError = (error: Error): void => {
-    // Check/download promises own their failures. Installation can fail after quitAndInstall returns.
     if (this.current.phase === 'installing') {
       this.setState(this.failure(error, 'install'))
     }
@@ -61,15 +129,13 @@ export class DesktopUpdateCoordinator {
     private readonly publish: (state: DesktopUpdateState) => DesktopUpdateState,
     private readonly beforeRestart: () => Promise<boolean>,
     private readonly updater: AppUpdater = autoUpdater,
-    private readonly enabled: () => boolean = () => app.isPackaged && existsSync(join(process.resourcesPath, 'app-update.yml')),
+    private readonly enabled: () => boolean = () => updateSourceExists(),
     private readonly currentVersion: () => string = () => app.getVersion(),
     private readonly downloadResult?: (success: boolean, reason?: string) => void,
     private channel: DesktopUpdateChannel = 'nightly',
     private readonly discard: (updater: AppUpdater) => Promise<void> = discardDesktopUpdate,
   ) {
     if (updater === autoUpdater) {
-      // electron-updater omits this internal transport property from its public declarations.
-      // Real-Electron qualification exercises the pinned dependency integration.
       const transportOwner = updater as AppUpdater & { httpExecutor: DesktopUpdateHttpExecutor }
       transportOwner.httpExecutor = new DesktopUpdateHttpExecutor(
         Number(process.env.DSH_DESKTOP_UPDATE_HTTP_IDLE_TIMEOUT_MS ?? 60_000),
@@ -84,7 +150,6 @@ export class DesktopUpdateCoordinator {
     this.updater.on('error', this.onError)
   }
 
-  /** Latest observable state; complete download identity remains main-process-owned. */
   get state(): DesktopUpdateState { return this.current }
 
   /** Reason ordinary updates are suspended, independently of the last operation result. */
@@ -225,7 +290,6 @@ export class DesktopUpdateCoordinator {
     return this.installOperation
   }
 
-  /** Remove owned listeners and prevent pending library operations from publishing into closed UI. */
   dispose(): void {
     this.disposed = true
     this.updater.off('download-progress', this.onProgress)
@@ -270,15 +334,47 @@ export class DesktopUpdateCoordinator {
     try {
       this.assertLive()
       if (!this.enabled()) throw new Error('desktop update: this application has no packaged update source')
-      const result = await this.updater.checkForUpdates()
+      // Level 1: check the branch's own update feed
+      let branchFeedError: unknown
+      try {
+        const result = await this.updater.checkForUpdates()
+        if (generation !== this.generation || this.disposed) return this.current
+        if (result === null) throw new Error('desktop update: no check result was returned')
+        this.cancellation = result.cancellationToken
+        const version = result.updateInfo.version
+        if (valid(version) === null) throw new DesktopFeedVersionError()
+        if (result.isUpdateAvailable && gt(version, this.currentVersion())) {
+          this.release = { kind: 'checked', version }
+          const notes = desktopUpdateReleaseNotes(result.updateInfo)
+          return this.setState({ phase: 'available', version, ...(notes === undefined ? {} : { notes }) })
+        }
+      } catch (error) {
+        // A feed that answered with a malformed version is a packaging fault, not an
+        // unreachable feed: it stays loud instead of hiding behind the upstream fallback.
+        if (error instanceof DesktopFeedVersionError) throw error
+        // Otherwise the feed is unreachable (e.g. no linux-latest tag published yet) — proceed to upstream
+        branchFeedError = error
+      }
       if (generation !== this.generation || this.disposed) return this.current
-      if (result === null) throw new Error('desktop update: no check result was returned')
-      this.cancellation = result.cancellationToken
-      const version = result.updateInfo.version
-      if (valid(version) === null) throw new Error('desktop update: feed version is invalid')
-      this.release = result.isUpdateAvailable && gt(version, this.currentVersion())
-        ? { kind: 'checked', version } : { kind: 'none' }
-      return this.setState(this.candidate === undefined ? { phase: 'idle' } : { phase: 'available', version })
+      // Level 2: fall back to upstream GitHub releases. The branch feed is this
+      // Linux build's own publication and may not exist yet; the official
+      // macOS and Windows feeds are always published, so those platforms keep
+      // master's single-feed check.
+      const upstreamVersion = process.platform === 'linux' ? await fetchUpstreamLatestVersion() : undefined
+      // An upstream version is informational only: it is not downloadable from the
+      // branch feed, so the release target resolves to none like any completed check.
+      this.release = { kind: 'none' }
+      if (upstreamVersion !== undefined && gt(upstreamVersion, this.currentVersion())) {
+        return this.setState({ phase: 'upstream_available', version: upstreamVersion })
+      }
+      if (branchFeedError !== undefined) {
+        // Neither feed could be read, so nothing was verified: the check failed and the
+        // schedule backs off. A reachable upstream that merely has nothing newer leaves
+        // the informational no_release phase.
+        if (upstreamVersion === undefined) throw branchFeedError
+        return this.setState({ phase: 'no_release' })
+      }
+      return this.setState({ phase: 'idle' })
     } catch (error) {
       if (generation !== this.generation || this.disposed) return this.current
       return this.failure(error, 'check')
